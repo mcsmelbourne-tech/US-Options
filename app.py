@@ -565,6 +565,102 @@ def fmt_local(when):
     return when.astimezone(LOCAL_TZ).strftime("%a %d %b %H:%M")
 
 
+# ----- Moomoo-style order ticket (dark panel, inline styles only) -----
+_BG, _FIELD, _LINE = "#1b1d22", "#2a2d34", "#3b3f48"
+_TXT, _MUT = "#e8eaed", "#8e939c"
+_GRN, _RED, _ORG, _BLU = "#2fbf71", "#ef4f5f", "#f26b21", "#2f6fed"
+
+
+def _lab(t):
+    return f'<div style="color:{_MUT};font-size:12px;margin:12px 0 4px 0">{t}</div>'
+
+
+def _box(inner, color=_TXT, align="left", extra=""):
+    return (f'<div style="background:{_FIELD};border:1px solid {_LINE};border-radius:4px;padding:8px 10px;'
+            f'color:{color};font-size:14px;text-align:{align};{extra}">{inner}</div>')
+
+
+def _stepper(value):
+    return (f'<div style="display:flex;align-items:center;background:{_FIELD};border:1px solid {_LINE};'
+            f'border-radius:4px;color:{_TXT};font-size:15px">'
+            f'<div style="padding:8px 12px;color:{_MUT}">&minus;</div>'
+            f'<div style="flex:1;text-align:center">{value}</div>'
+            f'<div style="padding:8px 12px;color:{_MUT}">+</div></div>')
+
+
+def _check(text):
+    return (f'<span style="display:inline-block;width:14px;height:14px;background:{_BLU};border-radius:2px;'
+            f'color:#fff;font-size:11px;line-height:14px;text-align:center;margin-right:6px;'
+            f'vertical-align:middle">&#10003;</span><span style="vertical-align:middle">{text}</span>')
+
+
+def _quote_bar(o, entry):
+    bid, ask = o["bid"], o["ask"]
+    live = bool(o["market_open"]) and ask > bid
+    pos = min(max((entry - bid) / (ask - bid), 0.0), 1.0) * 100 if live else 100.0
+    mid = (bid + ask) / 2 if live else o["last"]
+    f = (lambda v: f"{v:.2f}") if live else (lambda v: "--")
+    fill_left, fill_w = min(pos, 50.0), abs(pos - 50.0)
+    bar = (f'<div style="position:relative;height:14px;margin:8px 5px 4px 5px">'
+           f'<div style="position:absolute;top:6px;left:0;right:0;height:2px;background:{_LINE}"></div>'
+           f'<div style="position:absolute;top:6px;left:{fill_left}%;width:{fill_w}%;height:2px;background:{_RED}"></div>'
+           f'<div style="position:absolute;top:1px;left:calc({pos}% - 6px);width:8px;height:8px;'
+           f'border:2px solid {_RED};border-radius:50%;background:{_BG}"></div></div>')
+    labels = (f'<div style="display:flex;justify-content:space-between;color:{_MUT};font-size:12px">'
+              f'<span>Bid</span><span>Mid</span><span>Ask</span></div>'
+              f'<div style="display:flex;justify-content:space-between;color:{_TXT};font-size:13px;margin-top:2px">'
+              f'<span>{f(bid)}</span><span>{f(mid)}</span><span>{f(ask)}</span></div>')
+    return (f'<div style="background:{_FIELD};border:1px solid {_LINE};border-radius:4px;padding:8px 10px;margin-top:10px">'
+            f'{bar}{labels}</div>')
+
+
+def order_ticket_html(item):
+    """Looks like the Moomoo order ticket, filled with the scanner's values."""
+    o, p = item["opt"], item["plan"]
+    code = (o["expiry"][2:4] + o["expiry"][5:7] + o["expiry"][8:10] + f" {o['strike']:g}"
+            + ("C" if o["side"] == "CALL" else "P"))
+    entry_s, tp_s, sl_s = f"{p['entry']:.2f}", f"{p['tp']:.2f}", f"{p['sl']:.2f}"
+    gain_pct = (p["tp"] / p["entry"] - 1) * 100
+    loss_pct = (1 - p["sl"] / p["entry"]) * 100
+
+    tabs = (f'<div style="display:flex;gap:2px;margin-top:12px">'
+            f'<div style="flex:1;text-align:center;padding:7px;background:#3a3f4b;border-radius:4px 0 0 4px;'
+            f'color:{_TXT};font-size:14px">Trade</div>'
+            f'<div style="flex:1;text-align:center;padding:7px;background:{_FIELD};border-radius:0 4px 4px 0;'
+            f'color:{_MUT};font-size:14px">Ladder</div></div>')
+    contract_side = (f'<div style="display:flex;gap:10px;align-items:flex-end">'
+                     f'<div style="flex:3">{_lab("Contract")}{_box(code + "<span style=float:right>&#8964;</span>")}</div>'
+                     f'<div style="flex:1.4">{_lab("Side")}'
+                     f'{_box("Buy<span style=float:right>&#8644;</span>", color=_GRN, extra="background:#1d3a2b;")}</div></div>')
+    note_tp = f'<div style="font-size:12px;color:{_GRN};margin-top:4px">+${p["profit_1lot"]:,.0f} per lot (+{gain_pct:.0f}%)</div>'
+    note_sl = f'<div style="font-size:12px;color:{_RED};margin-top:4px">-${p["loss_1lot"]:,.0f} per lot (-{loss_pct:.0f}%)</div>'
+    amount = (f'<div style="display:flex;justify-content:space-between;margin-top:14px;font-size:14px">'
+              f'<span style="color:{_MUT}">Amount</span>'
+              f'<span style="color:{_TXT};font-weight:600">{p["cost_1lot"]:,.2f} USD(Debit)</span></div>')
+    button = (f'<div style="margin-top:12px;background:{_ORG};color:#fff;text-align:center;padding:10px;'
+              f'border-radius:4px;font-weight:600;font-size:14px">Enter these values in Moomoo</div>')
+
+    html = (
+        f'<div style="background:{_BG};border-radius:8px;padding:14px 16px;max-width:340px;'
+        f'font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:{_TXT}">'
+        f'<div style="font-size:16px;font-weight:600">Trade</div>'
+        f'<div style="color:{_MUT};font-size:12px;margin-top:2px">{o["symbol"]} - {o["side"]} - scanner values</div>'
+        f'{tabs}{contract_side}'
+        f'{_lab("Session")}{_box("RTH only", color=_MUT)}'
+        f'{_lab("Order Type")}{_box("Limit<span style=float:right>&#8964;</span>")}'
+        f'{_lab("Price")}{_stepper(entry_s)}'
+        f'{_quote_bar(o, p["entry"])}'
+        f'{_lab("Contractsx100 shares")}{_stepper("1")}'
+        f'{_lab("TIF")}{_box("Day<span style=float:right>&#8964;</span>")}'
+        f'<div style="margin-top:14px;font-size:14px">{_check("Take Profit")}&nbsp;&nbsp;&nbsp;{_check("Stop Loss")}</div>'
+        f'{_lab("TP Price")}{_stepper(tp_s)}{note_tp}'
+        f'{_lab("SL Price")}{_stepper(sl_s)}{note_sl}'
+        f'{_lab("TIF")}{_box("GTC<span style=float:right>&#8964;</span>")}'
+        f'{amount}{button}</div>'
+    )
+    return html
+
+
 def draw_box(item, side, is_top):
     icon = "🟢" if side == "CALL" else "🔴"
     if not item:
@@ -582,37 +678,38 @@ def draw_box(item, side, is_top):
         if not o["market_open"]:
             st.caption("Option quotes not live (market closed / pre-open) - last price used. Confirm bid/ask before entry.")
 
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.markdown("**Contract**")
-            st.write(f"Strike: **{o['strike']:g}**")
-            st.write(f"Expiry: **{o['expiry']}** ({o['dte']}d)")
-            st.write(f"Bid / Ask: {o['bid']:.2f} / {o['ask']:.2f}")
-            st.write(f"Spread: {o['spread']:.1f}%")
-            st.write(f"Vol / OI: {o['vol']} / {o['oi']}")
-        with c2:
-            st.markdown("**Greeks**")
-            st.write(f"Delta: **{o['delta']:.3f}**")
-            st.write(f"Gamma: {o['gamma']:.4f}")
-            st.write(f"Theta: {o['theta']:.3f} /day")
-            st.write(f"Vega: {o['vega']:.3f}")
-            st.write(f"Rho: {o['rho']:.3f}")
-            st.write(f"IV: {o['iv'] * 100:.1f}% (IV/HV {o['iv_ratio']:.2f})")
-        with c3:
-            st.markdown("**Stock & day prediction**")
-            st.write(f"Now: **{a['spot']:.2f}** (gap {a['gap']:+.2f}%)")
-            st.write(f"Day close est: **{a['pred_close']:.2f}**")
-            st.write(f"Day high / low est: {a['pred_high']:.2f} / {a['pred_low']:.2f}")
-            st.write(f"RSI {a['rsi']:.0f} | RVOL {a['rvol']:.1f}x")
-            st.write(f"Daily ATR: {a['day_atr']:.2f}")
-        with c4:
-            st.markdown("**Trade plan - 1 lot (100 sh)**")
-            st.write(f"Entry (buy @ ask): **${p['entry']:.2f}** (cost ${p['cost_1lot']:,.0f})")
-            st.write(f"Stop loss: **${p['sl']:.2f}** (-${p['loss_1lot']:,.0f}) | stock {p['stock_sl']}")
-            st.write(f"Take profit: **${p['tp']:.2f}** -> **+${p['profit_1lot']:,.0f}** | stock {p['stock_tp']}")
-            st.write(f"Reward:Risk {p['rr']}")
-            st.write("Exit: at TP or SL, early if a 5-min bar closes back through EMA15 against you, "
-                     "otherwise by 15:45 ET.")
+        left, right = st.columns([3, 2])
+        with left:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.markdown("**Contract**")
+                st.write(f"Strike: **{o['strike']:g}**")
+                st.write(f"Expiry: **{o['expiry']}** ({o['dte']}d)")
+                st.write(f"Bid / Ask: {o['bid']:.2f} / {o['ask']:.2f}")
+                st.write(f"Spread: {o['spread']:.1f}%")
+                st.write(f"Vol / OI: {o['vol']} / {o['oi']}")
+            with c2:
+                st.markdown("**Greeks**")
+                st.write(f"Delta: **{o['delta']:.3f}**")
+                st.write(f"Gamma: {o['gamma']:.4f}")
+                st.write(f"Theta: {o['theta']:.3f} /day")
+                st.write(f"Vega: {o['vega']:.3f}")
+                st.write(f"Rho: {o['rho']:.3f}")
+                st.write(f"IV: {o['iv'] * 100:.1f}% (IV/HV {o['iv_ratio']:.2f})")
+            with c3:
+                st.markdown("**Stock & day prediction**")
+                st.write(f"Now: **{a['spot']:.2f}** (gap {a['gap']:+.2f}%)")
+                st.write(f"Day close est: **{a['pred_close']:.2f}**")
+                st.write(f"High / low est: {a['pred_high']:.2f} / {a['pred_low']:.2f}")
+                st.write(f"RSI {a['rsi']:.0f} | RVOL {a['rvol']:.1f}x")
+                st.write(f"Daily ATR: {a['day_atr']:.2f}")
+            st.write(f"**Reward:Risk {p['rr']}** | stock stop {p['stock_sl']} / stock target {p['stock_tp']}")
+            st.write(f"**Take profit ${p['tp']:.2f} -> +${p['profit_1lot']:,.0f} per lot** | "
+                     f"stop loss ${p['sl']:.2f} -> -${p['loss_1lot']:,.0f} per lot")
+            st.caption("Exit: at TP or SL, early if a 5-min bar closes back through EMA15 against you, "
+                       "otherwise by 15:45 ET.")
+        with right:
+            st.markdown(order_ticket_html(item), unsafe_allow_html=True)
 
 
 def render_scan(res, empty_msg):
@@ -629,11 +726,8 @@ def render_scan(res, empty_msg):
     tg = " | Telegram sent ✅" if res.get("telegram") else ""
     st.write(f"Scan time: **{when.strftime('%a %d %b %H:%M')} ET** ({fmt_local(when)} your time) | "
              f"{res.get('scanned', '?')}/25 stocks read{tg}")
-    c_call, c_put = st.columns(2)
-    with c_call:
-        draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL")
-    with c_put:
-        draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT")
+    draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL")
+    draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT")
     with st.expander("All stocks - direction score & day estimate"):
         if res.get("table"):
             st.dataframe(pd.DataFrame(res["table"]).sort_values("score", key=abs, ascending=False))
