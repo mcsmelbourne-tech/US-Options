@@ -1,6 +1,5 @@
 import csv
 import os
-import time
 import json
 import datetime as dt
 from zoneinfo import ZoneInfo
@@ -66,11 +65,11 @@ def atr(df, n=14):
 
 # ----------------------------- DATA FETCH -----------------------------
 
-def fetch_1m_data(sym):
+def fetch_ohlc(sym):
     # Try 1-minute data first
     df = yf.download(sym, period="2d", interval="1m", progress=False)
 
-    # Fallback if market closed
+    # Fallback if market closed / empty
     if df is None or df.empty:
         df = yf.download(sym, period="5d", interval="5m", progress=False)
 
@@ -95,7 +94,7 @@ def fetch_1m_data(sym):
 # ----------------------------- ANALYSIS -----------------------------
 
 def analyse(sym):
-    df = fetch_1m_data(sym)
+    df = fetch_ohlc(sym)
     if df is None or len(df) < 40:
         return None
 
@@ -110,10 +109,9 @@ def analyse(sym):
     td = df[df["time_key"].dt.date == today]
     td = td if len(td) > 5 else df.tail(60)
 
-    # VWAP FIXED
+    # VWAP (safe)
     tp = (td["high"] + td["low"] + td["close"]) / 3
     vol_cum = td["volume"].cumsum().iloc[-1]
-
     if vol_cum == 0 or pd.isna(vol_cum):
         vwap = tp.iloc[-1]
     else:
@@ -160,7 +158,15 @@ def pick_option(sym, spot, side):
             return None
 
         today = dt.datetime.now(ET).date()
-        future = [e for e in expiries if dt.datetime.strptime(e, "%Y-%m-%d").date() > today]
+        future = []
+        for e in expiries:
+            try:
+                d = dt.datetime.strptime(e, "%Y-%m-%d").date()
+                if d > today:
+                    future.append(e)
+            except:
+                continue
+
         if not future:
             return None
 
@@ -224,9 +230,126 @@ def init_log():
     f = open(LOG_FILE, "a", newline="")
     w = csv.writer(f)
     if new:
-       w.writerow([
-    "time_et", "symbol", "side", "expiry", "strike", "spot", "pred_15m",
-    "bid", "ask", "score", "iv", "vol", "oi", "spread"
-])
+        w.writerow([
+            "time_et", "symbol", "side", "expiry", "strike", "spot", "pred_15m",
+            "bid", "ask", "score", "iv", "vol", "oi", "spread"
+        ])
+    return f, w
 
+# ----------------------------- SCAN -----------------------------
 
+def scan_once(cfg, writer):
+    now_et = dt.datetime.now(ET)
+    results = []
+
+    for sym in SYMBOLS:
+        a = analyse(sym)
+        if not a:
+            results.append({"symbol": sym, "status": "no data"})
+            continue
+
+        side = "CALL" if a["score"] >= MIN_SCORE else ("PUT" if a["score"] <= -MIN_SCORE else None)
+        if not side:
+            results.append({
+                "symbol": sym,
+                "status": "no trade",
+                "spot": round(a["spot"], 2),
+                "score": a["score"]
+            })
+            continue
+
+        opt = pick_option(sym, a["spot"], side)
+        if not opt:
+            results.append({
+                "symbol": sym,
+                "status": "no liquid ITM",
+                "spot": round(a["spot"], 2),
+                "score": a["score"]
+            })
+            continue
+
+        row = {
+            "symbol": sym,
+            "side": side,
+            "status": "ok",
+            "spot": round(a["spot"], 2),
+            "pred_15m": round(a["p15"], 2),
+            "expiry": opt["expiry"],
+            "strike": opt["strike"],
+            "bid": opt["bid"],
+            "ask": opt["ask"],
+            "iv": opt["iv"],
+            "vol": opt["vol"],
+            "oi": opt["oi"],
+            "spread": opt["spread"],
+            "score": a["score"]
+        }
+        results.append(row)
+
+        writer.writerow([
+            now_et.isoformat(timespec="seconds"),
+            sym, side, opt["expiry"], opt["strike"],
+            round(a["spot"], 2), round(a["p15"], 2),
+            opt["bid"], opt["ask"], a["score"],
+            opt["iv"], opt["vol"], opt["oi"], opt["spread"]
+        ])
+
+    return results
+
+# ----------------------------- STREAMLIT UI -----------------------------
+
+def main():
+    st.set_page_config(page_title="US ITM Scanner", layout="wide")
+
+    cfg = load_config()
+
+    st.title("📈 US ITM Call/Put Scanner (yfinance)")
+
+    st.sidebar.header("Telegram Alerts")
+    bot = st.sidebar.text_input("Bot Token", value=cfg.get("telegram_bot_token", ""), type="password")
+    chat = st.sidebar.text_input("Chat ID", value=cfg.get("telegram_chat_id", ""))
+
+    if st.sidebar.button("Save Telegram Settings"):
+        cfg["telegram_bot_token"] = bot.strip()
+        cfg["telegram_chat_id"] = chat.strip()
+        save_config(cfg)
+        st.sidebar.success("Saved Telegram settings.")
+
+    st.sidebar.markdown("---")
+    st.sidebar.write(f"Scan interval: {SCAN_SECONDS} seconds")
+    st.sidebar.write(f"Min score for trade: {MIN_SCORE}")
+
+    st.subheader("Watchlist (Top 25 US stocks)")
+    st.write(", ".join(SYMBOLS))
+
+    f, writer = init_log()
+
+    if st.button("Run Scan Now"):
+        with st.spinner("Running scan..."):
+            results = scan_once(cfg, writer)
+            f.flush()
+
+        df = pd.DataFrame(results)
+        st.subheader("Scan Results")
+        if df.empty:
+            st.warning("No results returned.")
+        else:
+            st.dataframe(df)
+
+            if "status" in df.columns:
+                valid = df[df["status"] == "ok"]
+                if not valid.empty:
+                    best = valid.iloc[0]
+                    st.success(
+                        f"BEST IDEA: {best['side']} {best['symbol']} | "
+                        f"Strike {best['strike']} | Exp {best['expiry']}"
+                    )
+                else:
+                    st.info("No qualifying trade this scan.")
+            else:
+                st.info("No qualifying trade this scan.")
+
+    f.close()
+
+if __name__ == "__main__":
+    main()
