@@ -110,8 +110,14 @@ def analyse(sym):
     td = df[df["time_key"].dt.date == today]
     td = td if len(td) > 5 else df.tail(60)
 
+    # VWAP FIXED
     tp = (td["high"] + td["low"] + td["close"]) / 3
-    vwap = (tp * td["volume"]).cumsum().iloc[-1] / max(td["volume"].cumsum().iloc[-1], 1)
+    vol_cum = td["volume"].cumsum().iloc[-1]
+
+    if vol_cum == 0 or pd.isna(vol_cum):
+        vwap = tp.iloc[-1]
+    else:
+        vwap = (tp * td["volume"]).cumsum().iloc[-1] / vol_cum
 
     spot = close.iloc[-1]
     score = 0
@@ -219,106 +225,4 @@ def init_log():
     w = csv.writer(f)
     if new:
         w.writerow([
-            "time_et","symbol","side","expiry","strike","spot","pred_15m",
-            "bid","ask","score","iv","vol","oi","spread"
-        ])
-    return f, w
-
-# ----------------------------- SCAN -----------------------------
-
-def scan_once(cfg, writer):
-    now_et = dt.datetime.now(ET)
-    results = []
-
-    for sym in SYMBOLS:
-        a = analyse(sym)
-        if not a:
-            results.append({"symbol": sym, "status": "no data"})
-            continue
-
-        side = "CALL" if a["score"] >= MIN_SCORE else ("PUT" if a["score"] <= -MIN_SCORE else None)
-        if not side:
-            results.append({"symbol": sym, "status": "no trade"})
-            continue
-
-        opt = pick_option(sym, a["spot"], side)
-        if not opt:
-            results.append({"symbol": sym, "status": "no liquid ITM"})
-            continue
-
-        results.append({
-            "symbol": sym,
-            "side": side,
-            "spot": round(a["spot"],2),
-            "pred_15m": round(a["p15"],2),
-            "expiry": opt["expiry"],
-            "strike": opt["strike"],
-            "bid": opt["bid"],
-            "ask": opt["ask"],
-            "iv": opt["iv"],
-            "vol": opt["vol"],
-            "oi": opt["oi"],
-            "spread": opt["spread"],
-            "score": a["score"]
-        })
-
-        writer.writerow([
-            now_et.isoformat(timespec="seconds"),
-            sym, side, opt["expiry"], opt["strike"],
-            round(a["spot"],2), round(a["p15"],2),
-            opt["bid"], opt["ask"], a["score"],
-            opt["iv"], opt["vol"], opt["oi"], opt["spread"]
-        ])
-
-    return results
-
-# ----------------------------- STREAMLIT UI -----------------------------
-
-def main():
-    st.set_page_config(page_title="US ITM Scanner", layout="wide")
-
-    cfg = load_config()
-
-    st.title("📈 US ITM Call/Put Scanner")
-
-    # Telegram settings
-    st.sidebar.header("Telegram Alerts")
-    bot = st.sidebar.text_input("Bot Token", value=cfg.get("telegram_bot_token",""), type="password")
-    chat = st.sidebar.text_input("Chat ID", value=cfg.get("telegram_chat_id",""))
-
-    if st.sidebar.button("Save Telegram Settings"):
-        cfg["telegram_bot_token"] = bot.strip()
-        cfg["telegram_chat_id"] = chat.strip()
-        save_config(cfg)
-        st.sidebar.success("Saved!")
-
-    st.sidebar.markdown("---")
-    st.sidebar.write("Scan interval: 5 minutes")
-    st.sidebar.write("Min score: 3")
-
-    f, writer = init_log()
-
-    if st.button("Run Scan Now"):
-        with st.spinner("Scanning..."):
-            results = scan_once(cfg, writer)
-            f.flush()
-
-        df = pd.DataFrame(results)
-        st.subheader("Scan Results")
-        st.dataframe(df)
-
-        # Summary card
-        valid = df[df["status"].isna()]
-        if len(valid):
-            best = valid.iloc[0]
-            st.success(
-                f"BEST IDEA: {best['side']} {best['symbol']} | "
-                f"Strike {best['strike']} | Exp {best['expiry']}"
-            )
-        else:
-            st.warning("No qualifying trade this scan.")
-
-    f.close()
-
-if __name__ == "__main__":
-    main()
+            "time_et","symbol
