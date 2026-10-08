@@ -97,7 +97,13 @@ def analyse(sym):
         return None
 
     close = df["close"]
-    e9, e20 = ema(close, 9), ema(close, 20)
+    e9 = ema(close, 9)
+    e20 = ema(close, 20)
+
+    # SAFE EMA extraction
+    ema9_last = float(e9.iloc[-1])
+    ema20_last = float(e20.iloc[-1])
+
     macd = ema(close, 12) - ema(close, 26)
     hist = macd - ema(macd, 9)
     r = rsi(close)
@@ -114,36 +120,43 @@ def analyse(sym):
     if len(vol_series) == 0:
         vol_cum = 0.0
     else:
-        vol_cum = float(vol_series.iloc[-1].item())
+        vol_cum = float(vol_series.iloc[-1])
 
     if vol_cum <= 0:
         vwap = tp.iloc[-1]
     else:
-        vwap = float((tp * td["volume"]).cumsum().iloc[-1].item()) / vol_cum
+        vwap = float((tp * td["volume"]).cumsum().iloc[-1]) / vol_cum
 
-    spot = close.iloc[-1]
+    spot = float(close.iloc[-1])
+
     score = 0
-    score += 1 if e9.iloc[-1] > e20.iloc[-1] else -1
+    score += 1 if ema9_last > ema20_last else -1
     score += 1 if spot > vwap else -1
-    score += 1 if r.iloc[-1] > 55 else (-1 if r.iloc[-1] < 45 else 0)
-    score += 1 if (hist.iloc[-1] > 0 and hist.iloc[-1] > hist.iloc[-2]) else (
-        -1 if (hist.iloc[-1] < 0 and hist.iloc[-1] < hist.iloc[-2]) else 0
+
+    rsi_last = float(r.iloc[-1])
+    score += 1 if rsi_last > 55 else (-1 if rsi_last < 45 else 0)
+
+    hist_last = float(hist.iloc[-1])
+    hist_prev = float(hist.iloc[-2])
+    score += 1 if (hist_last > 0 and hist_last > hist_prev) else (
+        -1 if (hist_last < 0 and hist_last < hist_prev) else 0
     )
-    mom = (spot - close.iloc[-6]) / max(a.iloc[-1], 1e-9)
+
+    mom = (spot - float(close.iloc[-6])) / max(float(a.iloc[-1]), 1e-9)
     score += 1 if mom > 0.5 else (-1 if mom < -0.5 else 0)
 
-    y = close.tail(12).values
+    y = close.tail(12).values.astype(float)
     x = np.arange(len(y))
     slope, icpt = np.polyfit(x, y, 1)
     base = slope * (len(y)-1) + icpt
     proj = {m: base + slope*m for m in (5,10,15)}
-    band = a.iloc[-1] * np.sqrt(10)
+    band = float(a.iloc[-1]) * np.sqrt(10)
 
     return dict(
         sym=sym,
         spot=spot,
         vwap=vwap,
-        rsi=r.iloc[-1],
+        rsi=rsi_last,
         score=score,
         p5=proj[5],
         p10=proj[10],
