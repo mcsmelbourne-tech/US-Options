@@ -16,9 +16,9 @@ ET = ZoneInfo("America/New_York")
 LOG_FILE = "scan_log.csv"
 CONFIG_FILE = "config.json"
 
-SCAN_SECONDS = 300            # 5 minutes
-MIN_SCORE = 3                 # |score| needed to call a trade
-STOP_LOSS_PCT = 25.0          # suggested premium stop
+SCAN_SECONDS = 300
+MIN_SCORE = 3
+STOP_LOSS_PCT = 25.0
 
 SYMBOLS = [
     "AAPL","MSFT","GOOGL","AMZN","META",
@@ -66,10 +66,8 @@ def atr(df, n=14):
 # ----------------------------- DATA FETCH -----------------------------
 
 def fetch_ohlc(sym):
-    # Try 1-minute data first
     df = yf.download(sym, period="2d", interval="1m", progress=False)
 
-    # Fallback if market closed / empty
     if df is None or df.empty:
         df = yf.download(sym, period="5d", interval="5m", progress=False)
 
@@ -109,13 +107,13 @@ def analyse(sym):
     td = df[df["time_key"].dt.date == today]
     td = td if len(td) > 5 else df.tail(60)
 
-    # VWAP (safe)
     tp = (td["high"] + td["low"] + td["close"]) / 3
-    vol_cum = td["volume"].cumsum().iloc[-1]
-    if vol_cum == 0 or pd.isna(vol_cum):
+    vol_cum = float(td["volume"].cumsum().iloc[-1])  # FIXED
+
+    if vol_cum <= 0:
         vwap = tp.iloc[-1]
     else:
-        vwap = (tp * td["volume"]).cumsum().iloc[-1] / vol_cum
+        vwap = float((tp * td["volume"]).cumsum().iloc[-1]) / vol_cum
 
     spot = close.iloc[-1]
     score = 0
@@ -128,7 +126,6 @@ def analyse(sym):
     mom = (spot - close.iloc[-6]) / max(a.iloc[-1], 1e-9)
     score += 1 if mom > 0.5 else (-1 if mom < -0.5 else 0)
 
-    # Price projection
     y = close.tail(12).values
     x = np.arange(len(y))
     slope, icpt = np.polyfit(x, y, 1)
@@ -231,8 +228,8 @@ def init_log():
     w = csv.writer(f)
     if new:
         w.writerow([
-            "time_et", "symbol", "side", "expiry", "strike", "spot", "pred_15m",
-            "bid", "ask", "score", "iv", "vol", "oi", "spread"
+            "time_et","symbol","side","expiry","strike","spot","pred_15m",
+            "bid","ask","score","iv","vol","oi","spread"
         ])
     return f, w
 
@@ -250,30 +247,20 @@ def scan_once(cfg, writer):
 
         side = "CALL" if a["score"] >= MIN_SCORE else ("PUT" if a["score"] <= -MIN_SCORE else None)
         if not side:
-            results.append({
-                "symbol": sym,
-                "status": "no trade",
-                "spot": round(a["spot"], 2),
-                "score": a["score"]
-            })
+            results.append({"symbol": sym, "status": "no trade"})
             continue
 
         opt = pick_option(sym, a["spot"], side)
         if not opt:
-            results.append({
-                "symbol": sym,
-                "status": "no liquid ITM",
-                "spot": round(a["spot"], 2),
-                "score": a["score"]
-            })
+            results.append({"symbol": sym, "status": "no liquid ITM"})
             continue
 
         row = {
             "symbol": sym,
             "side": side,
             "status": "ok",
-            "spot": round(a["spot"], 2),
-            "pred_15m": round(a["p15"], 2),
+            "spot": round(a["spot"],2),
+            "pred_15m": round(a["p15"],2),
             "expiry": opt["expiry"],
             "strike": opt["strike"],
             "bid": opt["bid"],
@@ -289,7 +276,7 @@ def scan_once(cfg, writer):
         writer.writerow([
             now_et.isoformat(timespec="seconds"),
             sym, side, opt["expiry"], opt["strike"],
-            round(a["spot"], 2), round(a["p15"], 2),
+            round(a["spot"],2), round(a["p15"],2),
             opt["bid"], opt["ask"], a["score"],
             opt["iv"], opt["vol"], opt["oi"], opt["spread"]
         ])
@@ -331,23 +318,17 @@ def main():
 
         df = pd.DataFrame(results)
         st.subheader("Scan Results")
-        if df.empty:
-            st.warning("No results returned.")
-        else:
-            st.dataframe(df)
+        st.dataframe(df)
 
-            if "status" in df.columns:
-                valid = df[df["status"] == "ok"]
-                if not valid.empty:
-                    best = valid.iloc[0]
-                    st.success(
-                        f"BEST IDEA: {best['side']} {best['symbol']} | "
-                        f"Strike {best['strike']} | Exp {best['expiry']}"
-                    )
-                else:
-                    st.info("No qualifying trade this scan.")
-            else:
-                st.info("No qualifying trade this scan.")
+        valid = df[df["status"] == "ok"]
+        if not valid.empty:
+            best = valid.iloc[0]
+            st.success(
+                f"BEST IDEA: {best['side']} {best['symbol']} | "
+                f"Strike {best['strike']} | Exp {best['expiry']}"
+            )
+        else:
+            st.info("No qualifying trade this scan.")
 
     f.close()
 
