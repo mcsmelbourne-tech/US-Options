@@ -108,12 +108,18 @@ def analyse(sym):
     td = td if len(td) > 5 else df.tail(60)
 
     tp = (td["high"] + td["low"] + td["close"]) / 3
-    vol_cum = float(td["volume"].cumsum().iloc[-1])  # FIXED
+
+    # SAFE VWAP FIX
+    vol_series = td["volume"].cumsum()
+    if len(vol_series) == 0:
+        vol_cum = 0.0
+    else:
+        vol_cum = float(vol_series.iloc[-1].item())
 
     if vol_cum <= 0:
         vwap = tp.iloc[-1]
     else:
-        vwap = float((tp * td["volume"]).cumsum().iloc[-1]) / vol_cum
+        vwap = float((tp * td["volume"]).cumsum().iloc[-1].item()) / vol_cum
 
     spot = close.iloc[-1]
     score = 0
