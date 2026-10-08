@@ -1,63 +1,64 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import datetime as dt
-import time
+# app.py
+import csv
 import os
-import io
-import plotly.graph_objects as go
+import time
+import json
+import datetime as dt
 from zoneinfo import ZoneInfo
 
-st.set_page_config(
-    page_title="Moomoo ITM Options Scanner",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import requests
+import streamlit as st
 
-# Custom CSS styling for premium look, clean cards, and responsive design
-st.markdown("""
-<style>
-    .main { background-color: #0e1117; color: #fafafa; }
-    .stMetric { background-color: #161b22; padding: 15px; border-radius: 10px; border: 1px solid #30363d; }
-    .card { background-color: #161b22; padding: 20px; border-radius: 12px; border: 1px solid #30363d; margin-bottom: 20px; }
-    .badge-call { background-color: #238636; color: white; padding: 4px 10px; border-radius: 6px; font-weight: bold; }
-    .badge-put { background-color: #da3633; color: white; padding: 4px 10px; border-radius: 6px; font-weight: bold; }
-    .badge-neutral { background-color: #8b949e; color: white; padding: 4px 10px; border-radius: 6px; font-weight: bold; }
-</style>
-""", unsafe_allow_html=True)
-
+# ----------------------------- SETTINGS -----------------------------
 ET = ZoneInfo("America/New_York")
+
 LOG_FILE = "scan_log.csv"
+CONFIG_FILE = "config.json"
 
-st.sidebar.title("⚙️ Scanner Settings")
+SCAN_SECONDS = 300            # 5 minutes
+MIN_SCORE = 3                 # |score| (max 5) needed to call a trade
+STOP_LOSS_PCT = 25.0          # suggested premium stop
+TRADING_MIN_PER_DAY = 390     # used to scale daily theta to the holding window (if needed)
 
-mode = st.sidebar.radio("Operating Mode", ["Simulation Mode (Cloud Ready)", "Live Moomoo OpenD (Local)"])
+TARGET_DELTA = 0.70           # kept for reference, but Greeks not available via yfinance
+MAX_SPREAD_PCT = 10.0
+MIN_OPTION_VOLUME = 50
 
-host = st.sidebar.text_input("OpenD Host", "127.0.0.1", disabled=(mode == "Simulation Mode (Cloud Ready)"))
-port = st.sidebar.number_input("OpenD Port", value=11111, step=1, disabled=(mode == "Simulation Mode (Cloud Ready)"))
+# Top 25 US stocks (you can edit this list)
+SYMBOLS = [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META",
+    "NVDA", "TSLA", "BRK-B", "UNH", "JNJ",
+    "V", "PG", "JPM", "HD", "MA",
+    "XOM", "BAC", "PFE", "KO", "PEP",
+    "CSCO", "ABBV", "ADBE", "NFLX", "CRM"
+]
+# --------------------------------------------------------------------
 
-symbols_input = st.sidebar.text_input("Watchlist Symbols (Comma Separated)", "NVDA, TSLA, AAPL, AMZN, MSFT")
-SYMBOLS = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
 
-st.sidebar.markdown("---")
-min_score = st.sidebar.slider("Min Score (|Score| required)", 1, 5, 3)
-target_delta = st.sidebar.slider("Target Option Delta", 0.50, 0.90, 0.70, 0.05)
-max_spread_pct = st.sidebar.slider("Max Spread %", 1.0, 25.0, 10.0, 0.5)
-min_option_volume = st.sidebar.number_input("Min Option Volume", 10, 500, 50, 10)
-stop_loss_pct = st.sidebar.slider("Suggested Stop Loss %", 10.0, 50.0, 25.0, 5.0)
-expiry_offset = st.sidebar.selectbox("Expiry Offset", [0, 1, 2], index=0, help="0 = next expiry after today, 1 = subsequent expiry")
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
-# Initialize CSV log file if not exists
-if not os.path.exists(LOG_FILE):
-    df_init = pd.DataFrame(columns=[
-        "time_et", "symbol", "side", "contract", "expiry", "strike", "spot", "pred_15m",
-        "bid", "ask", "target", "stop", "score", "rr", "delta", "gamma", "theta", "vega", "rho", "iv"
-    ])
-    df_init.to_csv(LOG_FILE, index=False)
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
 
 def ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
+
 
 def rsi(close, n=14):
     d = close.diff()
@@ -65,278 +66,412 @@ def rsi(close, n=14):
     dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
     return 100 - 100 / (1 + up / dn.replace(0, np.nan))
 
+
 def atr(df, n=14):
     pc = df["close"].shift()
-    tr = pd.concat([df["high"] - df["low"], (df["high"] - pc).abs(), (df["low"] - pc).abs()], axis=1).max(axis=1)
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - pc).abs(),
+            (df["low"] - pc).abs()
+        ],
+        axis=1
+    ).max(axis=1)
     return tr.ewm(alpha=1 / n, adjust=False).mean()
 
-def generate_mock_market_data(sym):
-    np.random.seed(hash(sym + dt.datetime.now().strftime("%Y%m%d%H%M")) % 2**32)
-    base_price = {"NVDA": 130.0, "TSLA": 220.0, "AAPL": 230.0, "AMZN": 185.0, "MSFT": 420.0}.get(sym, 150.0)
-    
-    # Generate 100 1-minute synthetic candles
-    timestamps = [dt.datetime.now(ET) - dt.timedelta(minutes=i) for i in range(100, 0, -1)]
-    noise = np.random.normal(0, 0.4, 100).cumsum()
-    close_prices = base_price + noise
-    high_prices = close_prices + np.random.uniform(0.1, 0.5, 100)
-    low_prices = close_prices - np.random.uniform(0.1, 0.5, 100)
-    open_prices = close_prices + np.random.normal(0, 0.2, 100)
-    volumes = np.random.randint(1000, 50000, 100)
-    
-    df = pd.DataFrame({
-        "time_key": [t.strftime("%Y-%m-%d %H:%M:%S") for t in timestamps],
-        "open": open_prices,
-        "high": high_prices,
-        "low": low_prices,
-        "close": close_prices,
-        "volume": volumes
-    })
-    return df
 
-def simulate_analysis(sym):
-    df = generate_mock_market_data(sym)
+def market_open_now():
+    n = dt.datetime.now(ET)
+    if n.weekday() >= 5:
+        return False
+    t = n.time()
+    # skip first 5 min and last 10 min
+    return dt.time(9, 35) <= t <= dt.time(15, 50)
+
+
+def fetch_1m_data(sym, lookback_days=2):
+    # yfinance 1m data is only available for recent days
+    try:
+        df = yf.download(
+            sym,
+            period=f"{lookback_days}d",
+            interval="1m",
+            auto_adjust=False,
+            progress=False
+        )
+        if df.empty:
+            return None
+        df = df.rename(
+            columns={
+                "Open": "open",
+                "High": "high",
+                "Low": "low",
+                "Close": "close",
+                "Volume": "volume"
+            }
+        )
+        df = df.dropna(subset=["open", "high", "low", "close"])
+        df["time_key"] = df.index.tz_convert(ET)
+        return df
+    except Exception:
+        return None
+
+
+def analyse(sym):
+    df = fetch_1m_data(sym)
+    if df is None or len(df) < 40:
+        return None
+
+    for c in ("open", "high", "low", "close", "volume"):
+        df[c] = df[c].astype(float)
+
     close = df["close"]
     e9, e20 = ema(close, 9), ema(close, 20)
     macd = ema(close, 12) - ema(close, 26)
     hist = macd - ema(macd, 9)
     r = rsi(close)
     a = atr(df)
-    
+
+    today = dt.datetime.now(ET).date()
+    td = df[df["time_key"].dt.date == today]
+    td = td if len(td) > 5 else df.tail(60)
+
+    tp = (td["high"] + td["low"] + td["close"]) / 3
+    vwap = (tp * td["volume"]).cumsum().iloc[-1] / max(td["volume"].cumsum().iloc[-1], 1)
+
     spot = close.iloc[-1]
-    vwap = spot * (1 + np.random.normal(0, 0.002))
-    
     score = 0
     score += 1 if e9.iloc[-1] > e20.iloc[-1] else -1
     score += 1 if spot > vwap else -1
     score += 1 if r.iloc[-1] > 55 else (-1 if r.iloc[-1] < 45 else 0)
-    score += 1 if (hist.iloc[-1] > 0 and hist.iloc[-1] > hist.iloc[-2]) else (-1 if (hist.iloc[-1] < 0 and hist.iloc[-1] < hist.iloc[-2]) else 0)
+    score += 1 if (hist.iloc[-1] > 0 and hist.iloc[-1] > hist.iloc[-2]) else (
+        -1 if (hist.iloc[-1] < 0 and hist.iloc[-1] < hist.iloc[-2]) else 0
+    )
     mom = (spot - close.iloc[-6]) / max(a.iloc[-1], 1e-9)
     score += 1 if mom > 0.5 else (-1 if mom < -0.5 else 0)
-    score = int(np.clip(score, -5, 5))
 
+    # price projection: linear regression on last 12 closes, extended 5/10/15 min
     y = close.tail(12).values
     x = np.arange(len(y))
     slope, icpt = np.polyfit(x, y, 1)
     base = slope * (len(y) - 1) + icpt
     proj = {m: base + slope * m for m in (5, 10, 15)}
-    band = a.iloc[-1] * np.sqrt(10)
+    band = a.iloc[-1] * np.sqrt(10)  # ~1 sigma for a 10-min window
 
-    return df, dict(sym=sym, spot=spot, vwap=vwap, rsi=r.iloc[-1], score=score,
-                    p5=proj[5], p10=proj[10], p15=proj[15], band=band, atr=a.iloc[-1])
-
-def simulate_option_pick(sym, spot, side):
-    expiry_date = (dt.datetime.now(ET) + dt.timedelta(days=(7 * (expiry_offset + 1)))).strftime("%Y-%m-%d")
-    strike_offset = -2.0 if side == "CALL" else 2.0
-    strike = round(spot + strike_offset, 1)
-    contract_code = f"US.{sym}{expiry_date.replace('-', '')}{side[0]}{int(strike*1000):08d}"
-    
-    bid = round(max(3.50, abs(spot - strike) + np.random.uniform(2.0, 5.0)), 2)
-    ask = round(bid + np.random.uniform(0.10, 0.40), 2)
-    spread_pct = (ask - bid) / ask * 100
-    
     return dict(
-        code=contract_code, expiry=expiry_date, strike=strike, bid=bid, ask=ask,
-        delta=0.71 if side == "CALL" else -0.69, gamma=0.035, theta=-0.15,
-        vega=0.22, rho=0.05, iv=32.5, vol=1250, oi=4500, spread=spread_pct
+        sym=sym,
+        spot=spot,
+        vwap=vwap,
+        rsi=r.iloc[-1],
+        score=score,
+        p5=proj[5],
+        p10=proj[10],
+        p15=proj[15],
+        band=band,
+        atr=a.iloc[-1]
     )
 
-st.title("📈 Moomoo ITM Call/Put Signal Scanner")
-st.markdown("Real-time quantitative momentum scoring, regression price projection, and deep ITM options filtration.")
 
-tab1, tab2, tab3 = st.tabs(["🚀 Live / Mock Scanner", "📋 Scan Log History", "📊 Performance & Analytics"])
+def pick_option(sym, spot, side):
+    """
+    Use yfinance option chain for a single expiry:
+    - Skip same-day expiry (0DTE) by picking the first future expiry.
+    - Choose ITM contracts with tight spread and real volume.
+    NOTE: Greeks are not available via yfinance, so we only use basic fields.
+    """
+    try:
+        t = yf.Ticker(sym)
+        expiries = t.options
+        if not expiries:
+            return None
 
-with tab1:
-    col_ctrl1, col_ctrl2 = st.columns([2, 6])
-    with col_ctrl1:
-        run_scan_btn = st.button("🔍 Run Scan Now", type="primary", use_container_width=True)
-    with col_ctrl2:
-        st.info(f"Active Watchlist: {', '.join(SYMBOLS)} | Target Delta: ~{target_delta} | Min Score: ±{min_score}")
+        # pick the first expiry that is strictly after today
+        today = dt.datetime.now(ET).date()
+        future_expiries = []
+        for e in expiries:
+            try:
+                d = dt.datetime.strptime(e, "%Y-%m-%d").date()
+                if d > today:
+                    future_expiries.append(e)
+            except Exception:
+                continue
 
-    if run_scan_btn or "scanned_results" not in st.session_state:
-        with st.spinner("Analyzing ticker momentum, calculating regressions, and querying options chain..."):
-            time.sleep(1) # Simulated scan latency
-            scan_results = []
-            new_log_rows = []
-            
-            for sym in SYMBOLS:
-                if mode == "Simulation Mode (Cloud Ready)":
-                    df_candles, analysis = simulate_analysis(sym)
-                    side = "CALL" if analysis["score"] >= min_score else ("PUT" if analysis["score"] <= -min_score else None)
-                    
-                    opt = None
-                    if side:
-                        opt = simulate_option_pick(sym, analysis["spot"], side)
-                        
-                    scan_results.append({
-                        "sym": sym, "df": df_candles, "analysis": analysis, "side": side, "opt": opt
-                    })
-                    
-                    if side and opt:
-                        dS = analysis["p15"] - analysis["spot"]
-                        theta_cost = opt["theta"] * (15 / 390)
-                        est_change = opt["delta"] * dS + 0.5 * opt["gamma"] * dS ** 2 + theta_cost
-                        entry = opt["ask"]
-                        target = max(entry + est_change, entry)
-                        stop = entry * (1 - stop_loss_pct / 100)
-                        rr = (target - entry) / (entry - stop) if entry > stop else 0
-                        
-                        new_log_rows.append([
-                            dt.datetime.now(ET).isoformat(timespec="seconds"), sym, side, opt["code"],
-                            opt["expiry"], opt["strike"], round(analysis["spot"], 2), round(analysis["p15"], 2),
-                            opt["bid"], opt["ask"], round(target, 2), round(stop, 2), analysis["score"], round(rr, 2),
-                            round(opt["delta"], 4), round(opt["gamma"], 5), round(opt["theta"], 4),
-                            round(opt["vega"], 4), round(opt["rho"], 4), round(opt["iv"], 2)
-                        ])
-                else:
-                    # Live Moomoo API fallback warning for cloud environments
-                    st.warning("Live Moomoo OpenD requires a local gateway running on port 11111. Please switch to Simulation Mode for cloud deployments.")
-                    break
-            
-            if new_log_rows:
-                df_logs = pd.read_csv(LOG_FILE)
-                df_new = pd.DataFrame(new_log_rows, columns=df_logs.columns)
-                df_combined = pd.concat([df_logs, df_new], ignore_index=True)
-                df_combined.to_csv(LOG_FILE, index=False)
-                
-            st.session_state["scanned_results"] = scan_results
+        if not future_expiries:
+            return None
 
-    if "scanned_results" in st.session_state:
-        st.markdown("### 🔍 Scan Results by Symbol")
-        
-        for item in st.session_state["scanned_results"]:
-            sym = item["sym"]
-            a = item["analysis"]
-            side = item["side"]
-            opt = item["opt"]
-            
-            with st.container():
-                st.markdown(f"""
-                <div class="card">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <h3 style="margin: 0;">{sym} &nbsp;|&nbsp; Spot: ${a['spot']:.2f}</h3>
-                        <div>
-                            <span>Score: <b>{a['score']:+d}</b></span> &nbsp;&nbsp;|&nbsp;&nbsp;
-                            <span>RSI: <b>{a['rsi']:.0f}</b></span> &nbsp;&nbsp;|&nbsp;&nbsp;
-                            {'<span class="badge-call">CALL SIGNAL</span>' if side == 'CALL' else ('<span class="badge-put">PUT SIGNAL</span>' if side == 'PUT' else '<span class="badge-neutral">NO TRADE</span>')}
-                        </div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                col_chart, col_details = st.columns([3, 2])
-                
-                with col_chart:
-                    # Plotly chart with regression projections and ATR bands
-                    fig = go.Figure()
-                    df_c = item["df"]
-                    
-                    fig.add_trace(go.Candlestick(
-                        x=df_c['time_key'], open=df_c['open'], high=df_c['high'], low=df_c['low'], close=df_c['close'],
-                        name="1m Candles"
-                    ))
-                    
-                    # Projection line
-                    last_time = pd.to_datetime(df_c['time_key'].iloc[-1])
-                    future_times = [last_time + pd.Timedelta(minutes=m) for m in (5, 10, 15)]
-                    future_prices = [a['p5'], a['p10'], a['p15']]
-                    
-                    fig.add_trace(go.Scatter(
-                        x=[df_c['time_key'].iloc[-1]] + [t.strftime("%Y-%m-%d %H:%M:%S") for t in future_times],
-                        y=[a['spot']] + future_prices,
-                        mode='lines+markers',
-                        name='15m Regression Projection',
-                        line=dict(color='cyan', dash='dash', width=2)
-                    ))
-                    
-                    fig.update_layout(
-                        title=f"{sym} Price Action & 15m Projection",
-                        template="plotly_dark",
-                        height=300,
-                        margin=dict(l=10, r=10, t=30, b=10),
-                        xaxis_rangeslider_visible=False
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                with col_details:
-                    if opt and side:
-                        dS = a["p15"] - a["spot"]
-                        theta_cost = opt["theta"] * (15 / 390)
-                        est_change = opt["delta"] * dS + 0.5 * opt["gamma"] * dS ** 2 + theta_cost
-                        entry = opt["ask"]
-                        target = max(entry + est_change, entry)
-                        stop = entry * (1 - stop_loss_pct / 100)
-                        rr = (target - entry) / (entry - stop) if entry > stop else 0
-                        
-                        st.markdown(f"""
-                        **Contract:** `{opt['code']}`  
-                        **Strike:** `${opt['strike']}` | **Expiry:** `{opt['expiry']}`  
-                        **Bid/Ask:** `${opt['bid']:.2f}` / `${opt['ask']:.2f}` (Spread: {opt['spread']:.1f}%)  
-                        **Greeks:** $\\Delta$ `{opt['delta']:.2f}` | $\\Gamma$ `{opt['gamma']:.3f}` | $\\Theta$ `{opt['theta']:.2f}`  
-                        **Trade Setup:**  
-                        - **Entry Ask $\\le$** `${entry:.2f}`  
-                        - **Est. 15m Change:** `{est_change:+.2f}`  
-                        - **Target:** `~${target:.2f}` | **Stop:** `${stop:.2f}` (R:R `{rr:.1f}`)  
-                        """)
-                    else:
-                        st.markdown("_No high-conviction ITM contract meeting liquidity and delta criteria during this scan._")
+        expiry = sorted(future_expiries)[0]
 
-with tab2:
-    st.subheader("📁 Scan Log History (`scan_log.csv`)")
-    if os.path.exists(LOG_FILE):
-        df_log_view = pd.read_csv(LOG_FILE)
-        st.dataframe(df_log_view, use_container_width=True)
-        
-        col_dl1, col_dl2 = st.columns([2, 8])
-        with col_dl1:
-            csv_bytes = df_log_view.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Download scan_log.csv",
-                data=csv_bytes,
-                file_name="scan_log.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-        with col_dl2:
-            if st.button("🗑️ Clear Log History"):
-                pd.DataFrame(columns=df_log_view.columns).to_csv(LOG_FILE, index=False)
-                st.success("Scan history cleared successfully.")
-                st.rerun()
-    else:
-        st.info("No scan history logged yet.")
+        chain = t.option_chain(expiry)
+        df_opts = chain.calls if side == "CALL" else chain.puts
+        if df_opts.empty:
+            return None
 
-with tab3:
-    st.subheader("📊 Strategy Performance & Distribution")
-    if os.path.exists(LOG_FILE):
-        df_analytics = pd.read_csv(LOG_FILE)
-        if not df_analytics.empty:
-            col_met1, col_met2, col_met3 = st.columns(3)
-            with col_met1:
-                st.metric("Total Signals Logged", len(df_analytics))
-            with col_met2:
-                calls_count = len(df_analytics[df_analytics["side"] == "CALL"])
-                puts_count = len(df_analytics[df_analytics["side"] == "PUT"])
-                st.metric("Calls vs Puts", f"{calls_count} Calls / {puts_count} Puts")
-            with col_met3:
-                avg_rr = df_analytics["rr"].mean() if "rr" in df_analytics.columns else 0.0
-                st.metric("Avg Projected Risk:Reward", f"{avg_rr:.2f}")
-            
-            st.markdown("---")
-            col_ch1, col_ch2 = st.columns(2)
-            with col_ch1:
-                if "symbol" in df_analytics.columns:
-                    sym_counts = df_analytics["symbol"].value_counts().reset_index()
-                    fig_sym = go.Figure(go.Bar(x=sym_counts["symbol"], y=sym_counts["count"], marker_color="#238636"))
-                    fig_sym.update_layout(title="Signals by Symbol", template="plotly_dark", height=300)
-                    st.plotly_chart(fig_sym, use_container_width=True)
-            with col_ch2:
-                if "rr" in df_analytics.columns:
-                    fig_rr = go.Figure(go.Histogram(x=df_analytics["rr"], marker_color="#1f6feb"))
-                    fig_rr.update_layout(title="Risk:Reward Distribution", template="plotly_dark", height=300)
-                    st.plotly_chart(fig_rr, use_container_width=True)
+        # ITM filter
+        if side == "CALL":
+            itm = df_opts[df_opts["strike"] < spot]
         else:
-            st.info("Log file is empty. Run scans to populate analytics.")
-    else:
-        st.info("No log data available.")
+            itm = df_opts[df_opts["strike"] > spot]
 
-st.markdown("---")
-st.markdown("<p style='text-align: center; color: #8b949e;'>Moomoo ITM Options Scanner | Designed for GitHub & Streamlit Cloud Deployment</p>", unsafe_allow_html=True)
+        if itm.empty:
+            return None
+
+        itm = itm.assign(dist=(itm["strike"] - spot).abs()).sort_values("dist").head(6)
+
+        # basic liquidity filters
+        itm["spread_pct"] = (itm["ask"] - itm["bid"]) / itm["ask"].replace(0, np.nan) * 100
+        itm = itm[
+            (itm["bid"] > 0) &
+            (itm["ask"] > 0) &
+            (itm["spread_pct"] <= MAX_SPREAD_PCT) &
+            (itm["volume"] >= MIN_OPTION_VOLUME)
+        ]
+
+        if itm.empty:
+            return None
+
+        # choose closest to target delta if impliedVolatility is present (rough proxy),
+        # otherwise just pick the first row
+        best = itm.iloc[0]
+
+        return dict(
+            symbol=sym,
+            expiry=expiry,
+            strike=float(best["strike"]),
+            bid=float(best["bid"]),
+            ask=float(best["ask"]),
+            iv=float(best.get("impliedVolatility", np.nan)),
+            vol=int(best.get("volume", 0)),
+            oi=int(best.get("openInterest", 0)),
+            spread=float(best["spread_pct"])
+        )
+    except Exception:
+        return None
+
+
+def send_telegram_alert(cfg, message):
+    token = cfg.get("telegram_bot_token")
+    chat_id = cfg.get("telegram_chat_id")
+    if not token or not chat_id:
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    try:
+        requests.post(url, data=payload, timeout=5)
+    except Exception:
+        pass
+
+
+def init_log_file():
+    new_file = not os.path.exists(LOG_FILE)
+    f = open(LOG_FILE, "a", newline="")
+    w = csv.writer(f)
+    if new_file:
+        w.writerow([
+            "time_et", "symbol", "side", "expiry", "strike", "spot", "pred_15m",
+            "bid", "ask", "target", "stop", "score",
+            "iv", "vol", "oi", "spread"
+        ])
+    return f, w
+
+
+def scan_once(cfg, writer):
+    now_et = dt.datetime.now(ET)
+    header = f"=== Scan {now_et:%Y-%m-%d %H:%M:%S} ET ==="
+    print(header)
+    log_lines = [header]
+
+    ideas = []
+
+    for sym in SYMBOLS:
+        try:
+            a = analyse(sym)
+            if not a:
+                line = f"{sym}: no data"
+                print(line)
+                log_lines.append(line)
+                continue
+
+            side = "CALL" if a["score"] >= MIN_SCORE else ("PUT" if a["score"] <= -MIN_SCORE else None)
+            line = (
+                f"{sym:5} ${a['spot']:.2f} | score {a['score']:+d} | RSI {a['rsi']:.0f} | "
+                f"pred 5/10/15m: {a['p5']:.2f}/{a['p10']:.2f}/{a['p15']:.2f} (+/-{a['band']:.2f})"
+            )
+
+            if not side:
+                line_no_trade = line + " | NO TRADE"
+                print(line_no_trade)
+                log_lines.append(line_no_trade)
+                continue
+
+            opt = pick_option(sym, a["spot"], side)
+            if not opt:
+                msg = line + f" | {side} signal but no liquid ITM contract"
+                print(msg)
+                log_lines.append(msg)
+                continue
+
+            # simple target based on projected move vs current spot
+            dS = a["p15"] - a["spot"]
+            entry = opt["ask"]
+            # approximate premium change proportional to underlying move
+            est_change = entry * (dS / max(a["spot"], 1e-9))
+            target = max(entry + est_change, entry)
+            stop = entry * (1 - STOP_LOSS_PCT / 100)
+            rr = (target - entry) / (entry - stop) if entry > stop else 0
+
+            # breakeven: underlying move needed to cover half the spread
+            cost = (opt["ask"] - opt["bid"])
+            be_move = cost / max(0.01 * a["spot"], 1e-9)  # rough proxy
+
+            print(line)
+            log_lines.append(line)
+
+            opt_line = (
+                f"   -> {side} {sym}  exp {opt['expiry']}  strike {opt['strike']}  "
+                f"bid/ask {opt['bid']:.2f}/{opt['ask']:.2f}  vol {opt['vol']:.0f}  "
+                f"OI {opt['oi']:.0f}  IV {opt['iv']:.3f}  spread {opt['spread']:.1f}%"
+            )
+            print(opt_line)
+            log_lines.append(opt_line)
+
+            rr_line = (
+                f"      entry<= {entry:.2f}  est 15m change {est_change:+.2f}  target ~{target:.2f}  "
+                f"stop {stop:.2f}  R:R {rr:.1f}  breakeven move ${be_move:.2f} (pred move ${abs(dS):.2f})"
+            )
+            print(rr_line)
+            log_lines.append(rr_line)
+
+            if abs(dS) < be_move:
+                warn = "      WARNING: predicted move is smaller than cost to break even - weak trade"
+                print(warn)
+                log_lines.append(warn)
+                continue
+
+            ideas.append((abs(a["score"]) * rr, sym, side, opt))
+
+            writer.writerow([
+                now_et.isoformat(timespec="seconds"),
+                sym,
+                side,
+                opt["expiry"],
+                opt["strike"],
+                round(a["spot"], 2),
+                round(a["p15"], 2),
+                opt["bid"],
+                opt["ask"],
+                round(target, 2),
+                round(stop, 2),
+                a["score"],
+                round(opt["iv"], 4),
+                opt["vol"],
+                opt["oi"],
+                round(opt["spread"], 2)
+            ])
+        except Exception as e:
+            import traceback
+            tb = traceback.extract_tb(e.__traceback__)
+            line = f"{sym}: error {e!r} at line {tb[-1].lineno}"
+            print(line)
+            log_lines.append(line)
+
+    if ideas:
+        ideas.sort(reverse=True)
+        _, s, side, opt = ideas[0]
+        best_msg = f"BEST IDEA THIS SCAN: {side} {s} exp {opt['expiry']} strike {opt['strike']}"
+        print(best_msg)
+        log_lines.append(best_msg)
+
+        # Telegram alert
+        alert_text = (
+            f"*BEST IDEA*\n"
+            f"{side} {s}\n"
+            f"Expiry: {opt['expiry']}\n"
+            f"Strike: {opt['strike']}\n"
+            f"Bid/Ask: {opt['bid']:.2f}/{opt['ask']:.2f}\n"
+        )
+        send_telegram_alert(cfg, alert_text)
+    else:
+        msg = "No qualifying trade this scan."
+        print(msg)
+        log_lines.append(msg)
+
+    return "\n".join(log_lines)
+
+
+# ----------------------------- STREAMLIT APP -----------------------------
+
+
+def main():
+    st.set_page_config(page_title="US ITM Call/Put Scanner", layout="wide")
+
+    st.title("US ITM Call/Put Scanner (yfinance + Telegram)")
+
+    cfg = load_config()
+
+    st.sidebar.header("Telegram Alerts")
+    bot_token = st.sidebar.text_input(
+        "Bot Token",
+        value=cfg.get("telegram_bot_token", ""),
+        type="password"
+    )
+    chat_id = st.sidebar.text_input(
+        "Chat ID",
+        value=cfg.get("telegram_chat_id", "")
+    )
+
+    if st.sidebar.button("Save Telegram Settings"):
+        cfg["telegram_bot_token"] = bot_token.strip()
+        cfg["telegram_chat_id"] = chat_id.strip()
+        save_config(cfg)
+        st.sidebar.success("Telegram settings saved (persisted to config.json).")
+
+    st.sidebar.markdown("---")
+    st.sidebar.write(f"Scan interval: {SCAN_SECONDS} seconds")
+    st.sidebar.write(f"Min score for trade: {MIN_SCORE}")
+    st.sidebar.write(f"Stop loss: {STOP_LOSS_PCT:.0f}%")
+
+    st.subheader("Watchlist (Top 25 US stocks)")
+    st.write(", ".join(SYMBOLS))
+
+    st.markdown("---")
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        run_once = st.button("Run Scan Once")
+
+    with col2:
+        auto_scan = st.checkbox("Auto-scan every 5 minutes (while page is open)")
+
+    log_output = st.empty()
+
+    # ensure log file exists
+    f, writer = init_log_file()
+
+    if run_once:
+        if not market_open_now():
+            log_output.warning("Market not in scan window (09:35–15:50 ET, Mon–Fri). Running anyway on latest data.")
+        text = scan_once(cfg, writer)
+        f.flush()
+        log_output.text(text)
+
+    if auto_scan:
+        if not market_open_now():
+            st.warning("Market not in scan window (09:35–15:50 ET, Mon–Fri). Auto-scan will still use latest data.")
+        # simple loop with sleep; note: Streamlit reruns script, so we keep it minimal
+        text = scan_once(cfg, writer)
+        f.flush()
+        log_output.text(text)
+        time.sleep(SCAN_SECONDS)
+        st.experimental_rerun()
+
+    f.close()
+
+
+if __name__ == "__main__":
+    main()
