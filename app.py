@@ -224,9 +224,9 @@ def init_log():
     f = open(LOG_FILE, "a", newline="")
     w = csv.writer(f)
     if new:
-        w.writerow([
-           w.writerow([
+       w.writerow([
     "time_et", "symbol", "side", "expiry", "strike", "spot", "pred_15m",
     "bid", "ask", "score", "iv", "vol", "oi", "spread"
 ])
+
 
