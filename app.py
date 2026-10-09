@@ -1,5 +1,5 @@
 """
-US Top-50 Call/Put Scanner - scheduled scans every US trading day (yfinance + Greeks)
+US Top-50 Call/Put Scanner - scheduled scans every US trading day (yfinance + Greeks + price action)
 
   Scan 1  PREMARKET    09:00 ET - gap, premarket range/volume, trend; option prices are indicative
   Scan 2  OPEN +10min  09:40 ET - re-scores everything, ADDS the premarket scan result
@@ -7,19 +7,29 @@ US Top-50 Call/Put Scanner - scheduled scans every US trading day (yfinance + Gr
   Scan 3+ HOURLY       10:40, 11:40, 12:40, 13:40, 14:40 ET - fresh picks through the day (volume is judged
                                   against the time of day; 14:40 is the last, trades exit by 15:45 ET)
 
-Per stock: EMA 9 / EMA 15, RSI, MACD, volume (relative to normal), ATR, VWAP, gap.
+Per stock: EMA 9 / EMA 15, RSI, MACD, volume (relative to normal), ATR, VWAP, gap
+           + PRICE ACTION: swing structure (HH/HL, LH/LL), break of structure (BOS), candle patterns
+             (engulfing, hammer, shooting star, strong bar), previous-day high/low breaks, and a
+             "blocked" check when the next support/resistance is too close for the expected move.
+             The stop loss is placed beyond the last swing low (call) / swing high (put).
 Per option: Black-Scholes Greeks (delta, gamma, theta, vega, rho) from yfinance implied vol,
             next expiry AFTER today, ranked by Greeks + spread + liquidity + IV vs historical vol.
 Output:     best CALL and best PUT in a box (+ one TOP PICK), predicted day price (close/high/low),
             entry, stop loss, take profit, profit for 1 lot. Compact Telegram alert for each scan.
 
+BACKTEST:   "Backtest" tab (or command line) replays the same scans on the last N trading days of 5-minute
+            data, prices the option with Black-Scholes, walks forward bar by bar to the SL / TP / 15:45 exit,
+            and compares results WITH and WITHOUT price action.
+
 Run:   streamlit run us_itm_scanner.py        (leave the page open - it fires the scans on time)
+       python us_itm_scanner.py --backtest 20 (backtest from the command line, 20 trading days)
 Needs: pip install streamlit yfinance pandas numpy requests
 Educational use only - estimates are heuristics, not advice.
 """
 
 import csv
 import os
+import sys
 import json
 import math
 import time
@@ -40,12 +50,14 @@ LOCAL_TZ = ZoneInfo("Australia/Sydney")      # only used to show your local time
 LOG_FILE = "scan_log.csv"
 CONFIG_FILE = "config.json"
 STATE_FILE = "scan_state.json"
+BT_FILE = "backtest_trades.csv"
 
 SCAN_PRE_TIME = dt.time(9, 0)                # premarket scan (ET)
 SCAN_OPEN_TIME = dt.time(9, 40)              # 10 min after the 09:30 open (ET)
 SCAN_OPEN_LATEST = dt.time(10, 30)           # if the app starts late, still run the open scan until here
 MARKET_OPEN = dt.time(9, 30)
 MARKET_CLOSE = dt.time(16, 0)
+EXIT_TIME = dt.time(15, 45)                  # trades are closed by this time
 HOURLY_TIMES = [dt.time(h, 40) for h in range(10, 15)]   # 10:40 ... 14:40 ET, every hour after the open scan
 HOURLY_GRACE_MIN = 20                                    # a late start can still run an hourly scan this long after its time
 
@@ -79,6 +91,15 @@ HOLD_HOURS = 6.0                             # time decay assumed before exit
 SL_MOVE_FRAC = 0.5                           # stock stop = 50% of the expected move against the trade
 MIN_LOSS, MAX_LOSS = 0.10, 0.30              # option stop loss clamped to 10-30% of premium
 MIN_RR = 1.3                                 # skip trades with reward:risk below this
+
+# price action
+SWING_K = 3                                  # a swing high/low = extreme of 3 bars either side (5-min bars)
+BLOCKED_FRAC = 0.35                          # next S/R closer than 35% of the expected move = trade is "blocked"
+
+# backtest assumptions (yfinance has no history of option quotes, so the option is MODELLED)
+BT_IV_MULT = 1.10                            # assumed option IV = 20-day historical vol x this
+BT_SLIPPAGE = 0.02                           # 2% of premium lost on entry and on stop / time exits
+BT_COMMISSION = 0.65                         # $ per contract per side
 
 SYMBOLS = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "META",
@@ -224,9 +245,7 @@ def _to_et(df):
     return df
 
 
-def fetch_intraday(sym):
-    """5-minute bars incl. premarket (04:00-16:00 ET), last 5 days."""
-    df = yf.Ticker(sym).history(period="5d", interval="5m", prepost=True)
+def _clean_intraday(df):
     if df is None or df.empty:
         return None
     df = _to_et(df).rename(columns=str.lower)[["open", "high", "low", "close", "volume"]].dropna()
@@ -234,19 +253,122 @@ def fetch_intraday(sym):
     return df[keep]
 
 
-def fetch_daily(sym):
-    d = yf.Ticker(sym).history(period="3mo", interval="1d")
+def fetch_intraday(sym):
+    """5-minute bars incl. premarket (04:00-16:00 ET), last 5 days."""
+    return _clean_intraday(yf.Ticker(sym).history(period="5d", interval="5m", prepost=True))
+
+
+def fetch_daily(sym, period="3mo"):
+    d = yf.Ticker(sym).history(period=period, interval="1d")
     if d is None or d.empty:
         return None
     d = d.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]].dropna()
     return d
 
+# ----------------------------- PRICE ACTION -----------------------------
+
+def _swings(df, k=SWING_K):
+    """Confirmed swing highs / lows (prices, oldest -> newest). A swing needs k bars on each side, so it never
+    uses future data."""
+    hi, lo = df["high"].to_numpy(), df["low"].to_numpy()
+    sh, sl = [], []
+    for i in range(k, len(df) - k):
+        w_hi, w_lo = hi[i - k:i + k + 1], lo[i - k:i + k + 1]
+        if hi[i] == w_hi.max() and (w_hi == hi[i]).sum() == 1:
+            sh.append(float(hi[i]))
+        if lo[i] == w_lo.min() and (w_lo == lo[i]).sum() == 1:
+            sl.append(float(lo[i]))
+    return sh, sl
+
+
+def price_action(df, hist_d, spot, atr5, pm_high, pm_low, mode):
+    """Returns (points, tags, info). Points are added to the indicator score.
+       +1/-1 each: swing structure, break of structure, candle pattern, previous-day high/low break.
+       info also holds the nearest support/resistance ('room') and the last swing low/high (stop reference)."""
+    pts, tags = 0, []
+
+    def add(v, tag):
+        nonlocal pts
+        pts += v
+        if v:
+            tags.append(("+" if v > 0 else "-") + "PA:" + tag)
+
+    reg = df[np.array([x >= MARKET_OPEN for x in df.index.time])].tail(120)
+    sh, sl = _swings(reg) if len(reg) >= 12 else ([], [])
+    pdh, pdl = float(hist_d["high"].iloc[-1]), float(hist_d["low"].iloc[-1])
+    info = dict(struct="none", candle="none", pdh=pdh, pdl=pdl, sw_hi=None, sw_lo=None,
+                room_up=None, room_dn=None)
+
+    # 1) swing structure + break of structure
+    if len(sh) >= 2 and len(sl) >= 2:
+        if sh[-1] > sh[-2] and sl[-1] > sl[-2]:
+            add(1, "HH/HL")
+            info["struct"] = "HH/HL (uptrend)"
+        elif sh[-1] < sh[-2] and sl[-1] < sl[-2]:
+            add(-1, "LH/LL")
+            info["struct"] = "LH/LL (downtrend)"
+        else:
+            info["struct"] = "range"
+    if sh and spot > sh[-1]:
+        add(1, "BOS-up")
+    elif sl and spot < sl[-1]:
+        add(-1, "BOS-down")
+
+    # 2) candle pattern on the last bar, only where it matters (reversal at an extreme, or a strong bar)
+    if mode != "pre" and len(reg) >= 14:
+        b0, b1 = reg.iloc[-1], reg.iloc[-2]
+        o0, c0, h0, l0 = float(b0["open"]), float(b0["close"]), float(b0["high"]), float(b0["low"])
+        o1, c1 = float(b1["open"]), float(b1["close"])
+        rng0, body0, body1 = h0 - l0, abs(c0 - o0), abs(c1 - o1)
+        if rng0 > 0:
+            up_w, lo_w = h0 - max(o0, c0), min(o0, c0) - l0
+            w = reg.tail(12)
+            lo12, hi12 = float(w["low"].min()), float(w["high"].max())
+            r12 = max(hi12 - lo12, 1e-9)
+            at_low, at_high = (l0 - lo12) / r12 <= 0.25, (hi12 - h0) / r12 <= 0.25
+            bull_eng = c1 < o1 and c0 > o0 and c0 >= o1 and o0 <= c1 and body0 > body1
+            bear_eng = c1 > o1 and c0 < o0 and c0 <= o1 and o0 >= c1 and body0 > body1
+            hammer = lo_w >= 2 * body0 and lo_w >= 0.6 * rng0 and up_w <= 0.25 * rng0
+            star = up_w >= 2 * body0 and up_w >= 0.6 * rng0 and lo_w <= 0.25 * rng0
+            if (bull_eng or hammer) and at_low:
+                name = "Bull engulf" if bull_eng else "Hammer"
+                add(1, name)
+                info["candle"] = name
+            elif (bear_eng or star) and at_high:
+                name = "Bear engulf" if bear_eng else "Shooting star"
+                add(-1, name)
+                info["candle"] = name
+            elif c0 > o0 and body0 >= 0.7 * rng0 and body0 >= atr5:
+                add(1, "Strong bar")
+                info["candle"] = "Strong green bar"
+            elif c0 < o0 and body0 >= 0.7 * rng0 and body0 >= atr5:
+                add(-1, "Strong bar")
+                info["candle"] = "Strong red bar"
+
+    # 3) previous-day high / low
+    if spot > pdh:
+        add(1, "PDH-break")
+    elif spot < pdl:
+        add(-1, "PDL-break")
+
+    # 4) nearest support / resistance ("room") and the stop reference swings
+    levels = [pdh, pdl] + [x for x in (pm_high, pm_low) if x is not None] + sh[-4:] + sl[-4:]
+    gap = 0.1 * atr5
+    above = [x - spot for x in levels if x > spot + gap]
+    below = [spot - x for x in levels if x < spot - gap]
+    info["room_up"] = min(above) if above else None
+    info["room_dn"] = min(below) if below else None
+    info["sw_lo"] = next((x for x in reversed(sl) if x < spot - gap), None)
+    info["sw_hi"] = next((x for x in reversed(sh) if x > spot + gap), None)
+    return pts, tags, info
+
 # ----------------------------- STOCK ANALYSIS + DAY PREDICTION -----------------------------
 
-def analyse(sym, mode, pre_prev):
-    """mode: 'pre', 'open' or 'hourly'. pre_prev: {symbol: score} from today's premarket scan (or None)."""
+def analyse_df(sym, df, dd, mode):
+    """Indicators + price action from the data given (the last bar of df = 'now'). Works for live data and for
+    the backtest (df cut at the scan time). mode: 'pre', 'open' or 'hourly'. Returns the raw pieces; finalize()
+    turns them into the score and the day prediction."""
     try:
-        df, dd = fetch_intraday(sym), fetch_daily(sym)
         if df is None or dd is None or len(df) < 40:
             return None
 
@@ -298,7 +420,7 @@ def analyse(sym, mode, pre_prev):
         else:
             rvol = 0.0
 
-        # ---- direction score ----
+        # ---- indicator score (direction) ----
         s, tags = 0, []
 
         def add(v, tag):
@@ -319,28 +441,69 @@ def analyse(sym, mode, pre_prev):
             add(1 if spot > pm_high else (-1 if spot < pm_low else 0), "PM-break")
         if mode != "pre" and len(reg) > 0 and abs(spot - day_open) > 0.25 * atr5:
             add(1 if spot > day_open else -1, "vsOpen")
-        if mode != "pre" and pre_prev and pre_prev.get(sym) and s != 0:
-            # premarket scan agreed with today's direction -> strengthen it; disagreed -> weaken it
-            agree = (pre_prev[sym] > 0) == (s > 0)
-            add((1 if s > 0 else -1) * (1 if agree else -1), "PM-scan")
-        if rsi_last > 75:
-            add(-1, "overbought")
-        elif rsi_last < 25:
-            add(1, "oversold")
+        ob = (-1, "overbought") if rsi_last > 75 else ((1, "oversold") if rsi_last < 25 else (0, ""))
 
-        # ---- day price prediction (ATR-based, scaled by conviction) ----
-        conf = float(np.clip(s / 7.0, -1, 1))
-        sign = 1 if s > 0 else -1
-        move = day_atr * (0.25 + 0.20 * abs(conf))
-        pred_close = spot + sign * move
-        pred_high = max(spot, pred_close) + 0.25 * day_atr
-        pred_low = min(spot, pred_close) - 0.25 * day_atr
+        # ---- price action ----
+        pa_s, pa_tags, pa = price_action(df, hist_d, spot, atr5, pm_high, pm_low, mode)
 
-        return dict(sym=sym, spot=spot, vwap=vwap, rsi=rsi_last, score=int(s), tags=tags,
-                    gap=gap, rvol=float(rvol), day_atr=day_atr, atr5=atr5, hv=hv, prev_close=prev_close,
-                    pm_high=pm_high, pm_low=pm_low, move=float(move),
-                    pred_close=float(pred_close), pred_high=float(pred_high), pred_low=float(pred_low),
-                    pre_score=(pre_prev or {}).get(sym))
+        return dict(sym=sym, mode=mode, spot=spot, vwap=vwap, rsi=rsi_last, gap=gap, rvol=float(rvol),
+                    day_atr=day_atr, atr5=atr5, hv=hv, prev_close=prev_close, pm_high=pm_high, pm_low=pm_low,
+                    s_core=int(s), tags_core=tags, ob=ob, pa_s=int(pa_s), pa_tags=pa_tags, pa=pa)
+    except Exception:
+        return None
+
+
+def finalize(a, use_pa=True, pre_prev=None):
+    """Final score, day prediction and stop reference. use_pa=False gives the original indicator-only score
+    (used by the backtest to compare)."""
+    a = dict(a)
+    sym = a["sym"]
+    s, tags = a["s_core"], list(a["tags_core"])
+
+    def add(v, tag):
+        nonlocal s
+        s += v
+        if v:
+            tags.append(("+" if v > 0 else "-") + tag)
+
+    if a["mode"] != "pre" and pre_prev and pre_prev.get(sym) and s != 0:
+        # premarket scan agreed with today's direction -> strengthen it; disagreed -> weaken it
+        agree = (pre_prev[sym] > 0) == (s > 0)
+        add((1 if s > 0 else -1) * (1 if agree else -1), "PM-scan")
+    add(*a["ob"])
+    if use_pa:
+        s += a["pa_s"]
+        tags += a["pa_tags"]
+
+    def predict(score):
+        conf = float(np.clip(score / 7.0, -1, 1))
+        return (1 if score > 0 else -1), a["day_atr"] * (0.25 + 0.20 * abs(conf))
+
+    sign, move = predict(s)
+    if use_pa and s != 0:
+        room = a["pa"]["room_up"] if s > 0 else a["pa"]["room_dn"]
+        if room is not None and room < BLOCKED_FRAC * move:      # next support/resistance is right in the way
+            s -= sign
+            tags.append("PA:blocked")
+            sign, move = predict(s)
+
+    spot = a["spot"]
+    pred_close = spot + sign * move
+    a.update(score=int(s), tags=tags, move=float(move),
+             pred_close=float(pred_close),
+             pred_high=float(max(spot, pred_close) + 0.25 * a["day_atr"]),
+             pred_low=float(min(spot, pred_close) - 0.25 * a["day_atr"]),
+             pre_score=(pre_prev or {}).get(sym),
+             sl_ref=(a["pa"]["sw_lo"] if s > 0 else a["pa"]["sw_hi"]) if use_pa else None,
+             pa_on=use_pa)
+    return a
+
+
+def analyse(sym, mode, pre_prev):
+    """Live analysis (current data) with price action on."""
+    try:
+        base = analyse_df(sym, fetch_intraday(sym), fetch_daily(sym), mode)
+        return finalize(base, True, pre_prev) if base else None
     except Exception:
         return None
 
@@ -416,7 +579,8 @@ def pick_option(sym, spot, side, hv):
 
 
 def trade_plan(opt, a):
-    """Stock targets from the day prediction, converted to option prices with Black-Scholes."""
+    """Stock targets from the day prediction, converted to option prices with Black-Scholes.
+       With price action on, the stock stop goes just beyond the last swing low (call) / swing high (put)."""
     side = opt["side"]
     sign = 1 if side == "CALL" else -1
     S, K, T, iv = a["spot"], opt["strike"], opt["T"], opt["iv"]
@@ -425,6 +589,11 @@ def trade_plan(opt, a):
     now_px = bs_price(S, K, T, iv, side)
     stock_tp = S + sign * a["move"]
     stock_sl = S - sign * a["move"] * SL_MOVE_FRAC
+    ref = a.get("sl_ref")
+    if ref is not None:                                   # structural stop, kept within a sensible distance
+        dist = abs(S - ref) + 0.1 * a["atr5"]
+        if 0.25 * a["move"] <= dist <= 1.0 * a["move"]:
+            stock_sl = S - sign * dist
     gain = bs_price(stock_tp, K, T_exit, iv, side) - now_px
     loss = now_px - bs_price(stock_sl, K, T_exit, iv, side)
 
@@ -452,7 +621,7 @@ def log_picks(res):
         if new:
             w.writerow(["time_et", "scan", "symbol", "side", "expiry", "strike", "spot", "pred_close", "pred_high",
                         "pred_low", "entry", "stop_loss", "take_profit", "profit_1lot", "delta", "gamma", "theta",
-                        "vega", "rho", "iv", "score", "top"])
+                        "vega", "rho", "iv", "score", "top", "price_action"])
         for side in ("CALL", "PUT"):
             it = res.get(side)
             if not it:
@@ -462,7 +631,7 @@ def log_picks(res):
                         round(a["pred_close"], 2), round(a["pred_high"], 2), round(a["pred_low"], 2),
                         p["entry"], p["sl"], p["tp"], p["profit_1lot"], round(o["delta"], 3), round(o["gamma"], 4),
                         round(o["theta"], 3), round(o["vega"], 3), round(o["rho"], 3), round(o["iv"], 3),
-                        a["score"], res.get("top") == side])
+                        a["score"], res.get("top") == side, " ".join(a["pa_tags"])])
 
 # ----------------------------- SCAN -----------------------------
 
@@ -472,8 +641,8 @@ def scan_once(mode, pre_prev=None, label=None):
         analysed = [a for a in ex.map(lambda s: analyse(s, mode, pre_prev), SYMBOLS) if a]
 
     table = [dict(symbol=a["sym"], price=round(a["spot"], 2), gap_pct=round(a["gap"], 2), rsi=round(a["rsi"], 1),
-                  rvol=round(a["rvol"], 2), score=a["score"], pre_score=a["pre_score"],
-                  day_est=round(a["pred_close"], 2)) for a in analysed]
+                  rvol=round(a["rvol"], 2), score=a["score"], price_action=a["pa_s"], pre_score=a["pre_score"],
+                  structure=a["pa"]["struct"], day_est=round(a["pred_close"], 2)) for a in analysed]
 
     cands = sorted([a for a in analysed if abs(a["score"]) >= MIN_SCORE], key=lambda a: -abs(a["score"]))[:CANDIDATES]
 
@@ -566,6 +735,206 @@ def run_scheduled(cfg):
         save_state(state)
     return key
 
+# ----------------------------- BACKTEST -----------------------------
+# yfinance only keeps 60 days of 5-minute bars and NO history of option quotes, so the backtest:
+#   1. replays every scan of the SCHEDULE on past days with the data available at that moment (no look-ahead),
+#   2. models the option: strike nearest delta 0.65, next Friday expiry, IV = 20-day HV x BT_IV_MULT, Black-Scholes,
+#   3. enters at the open of the bar after the scan (premarket scan: the 09:30 open), plus slippage,
+#   4. walks forward bar by bar: stop loss checked first (worst case) then take profit, otherwise exit 15:45 ET,
+#   5. runs the same scans twice - WITH price action and WITHOUT - so you can see what it adds.
+
+def fetch_history(symbols, progress=None):
+    """{symbol: (5-min bars incl. premarket, last 60 days ; daily bars, 6 months)}"""
+    out, done = {}, [0]
+
+    def one(sym):
+        try:
+            df = _clean_intraday(yf.Ticker(sym).history(period="60d", interval="5m", prepost=True))
+            dd = fetch_daily(sym, period="6mo")
+            if df is not None and dd is not None and len(df) > 200:
+                out[sym] = (df, dd)
+        except Exception:
+            pass
+        done[0] += 1
+        if progress:
+            progress(done[0] / len(symbols), f"Downloading history {done[0]}/{len(symbols)}")
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        list(ex.map(one, symbols))
+    return out
+
+
+def _next_friday(day):
+    d = day + dt.timedelta(days=1)
+    while d.weekday() != 4:
+        d += dt.timedelta(days=1)
+    return d
+
+
+def _strike_step(S):
+    return 0.5 if S < 25 else (1.0 if S < 100 else (2.5 if S < 200 else 5.0))
+
+
+def synth_option(sym, S, side, hv, now, iv_mult, slip):
+    """Modelled option: strike with delta closest to TARGET_DELTA, next Friday expiry (never same day)."""
+    exp_day = _next_friday(now.date())
+    exp_dt = dt.datetime.combine(exp_day, MARKET_CLOSE, tzinfo=ET)
+    T = (exp_dt - now).total_seconds() / (365 * 86400)
+    iv = float(np.clip(hv * iv_mult, 0.10, 2.0))
+    step = _strike_step(S)
+    base = round(S / step) * step
+    best = None
+    for k in range(-30, 31):
+        K = base + k * step
+        if K <= 0:
+            continue
+        g = greeks(S, K, T, iv, side)
+        if g and DELTA_MIN <= abs(g["delta"]) <= DELTA_MAX:
+            dist = abs(abs(g["delta"]) - TARGET_DELTA)
+            if best is None or dist < best[0]:
+                best = (dist, K, g)
+    if best is None:
+        return None
+    _, K, g = best
+    px = bs_price(S, K, T, iv, side)
+    if px < 0.20:
+        return None
+    return dict(symbol=sym, side=side, strike=float(K), expiry=str(exp_day), exp_dt=exp_dt, T=T, iv=iv,
+                entry=px * (1 + slip), delta=g["delta"])
+
+
+def simulate_trade(opt, plan, bars, slip):
+    """Walk the 5-min bars forward. Returns (exit_option_price, reason, exit_time) or None."""
+    if bars is None or bars.empty:
+        return None
+    side, K, iv, exp_dt = opt["side"], opt["strike"], opt["iv"], opt["exp_dt"]
+    tp, sl = plan["tp"], plan["sl"]
+
+    def val(S, t_end):
+        T = max((exp_dt - t_end).total_seconds() / (365 * 86400), 1.0 / (365 * 24))
+        return bs_price(S, K, T, iv, side)
+
+    last_ts = None
+    for ts, b in zip(bars.index, bars.itertuples()):
+        t_end = ts + pd.Timedelta(minutes=5)
+        v_open = val(b.open, ts)
+        if v_open <= sl:                                       # gapped through the stop
+            return v_open * (1 - slip), "SL", ts
+        if v_open >= tp:                                       # gapped through the target
+            return v_open, "TP", ts
+        worst, best = (b.low, b.high) if side == "CALL" else (b.high, b.low)
+        if val(worst, t_end) <= sl:                            # stop first when both are inside one bar
+            return sl * (1 - slip), "SL", ts
+        if val(best, t_end) >= tp:
+            return tp, "TP", ts
+        last_ts, last_close, last_end = ts, b.close, t_end
+    return val(last_close, last_end) * (1 - slip), "TIME", last_ts
+
+
+def run_backtest(data, days=20, iv_mult=BT_IV_MULT, slip=BT_SLIPPAGE, commission=BT_COMMISSION, progress=None):
+    """Returns a DataFrame with one row per trade, variant = 'Price action' or 'Indicators only'."""
+    if not data:
+        return pd.DataFrame()
+    today_et = dt.datetime.now(ET).date()
+    ref = max(data.values(), key=lambda x: len(x[0]))[0]
+    regr = ref[np.array([x >= MARKET_OPEN for x in ref.index.time])]
+    full = [d for d, g in regr.groupby(regr.index.date)
+            if d < today_et and len(g) >= 70 and g.index[-1].time() >= dt.time(15, 30)]
+    test_days = full[-days:]
+    variants = {"Price action": True, "Indicators only": False}
+    rows = []
+
+    for di, day in enumerate(test_days):
+        pre_scores = {v: {} for v in variants}
+        taken = set()
+        exit_ts = pd.Timestamp(dt.datetime.combine(day, EXIT_TIME), tz=ET)
+        for key, mode, start, _, label in SCHEDULE:
+            when = pd.Timestamp(dt.datetime.combine(day, start), tz=ET)
+            entry_ts = max(when, pd.Timestamp(dt.datetime.combine(day, MARKET_OPEN), tz=ET))
+            base = []
+            for sym, (df, dd) in data.items():
+                i = df.index.searchsorted(when)
+                a0 = analyse_df(sym, df.iloc[max(0, i - 720):i], dd, mode)
+                if a0:
+                    base.append(a0)
+
+            for vname, use_pa in variants.items():
+                fin = [finalize(a0, use_pa, pre_scores[vname] if mode != "pre" else None) for a0 in base]
+                if mode == "pre":
+                    pre_scores[vname] = {a["sym"]: a["score"] for a in fin}
+                cands = sorted([a for a in fin if abs(a["score"]) >= MIN_SCORE],
+                               key=lambda a: -abs(a["score"]))[:CANDIDATES]
+                best = {"CALL": None, "PUT": None}
+                for a in cands:
+                    side = "CALL" if a["score"] > 0 else "PUT"
+                    if (vname, a["sym"], side, day) in taken:
+                        continue
+                    df = data[a["sym"]][0]
+                    j0, j1 = df.index.searchsorted(entry_ts), df.index.searchsorted(exit_ts)
+                    bars = df.iloc[j0:j1]
+                    if len(bars) < 3:
+                        continue
+                    S_in = float(bars.iloc[0]["open"])
+                    opt = synth_option(a["sym"], S_in, side, a["hv"], entry_ts.to_pydatetime(), iv_mult, slip)
+                    if not opt:
+                        continue
+                    plan = trade_plan(opt, dict(a, spot=S_in))
+                    if not plan or plan["rr"] < MIN_RR:
+                        continue
+                    rank = abs(a["score"]) * 10 + min(plan["rr"], 3.0) * 5
+                    if best[side] is None or rank > best[side]["rank"]:
+                        best[side] = dict(a=a, opt=opt, plan=plan, bars=bars, rank=rank, side=side)
+
+                for side, b in best.items():
+                    if not b:
+                        continue
+                    a, opt, plan = b["a"], b["opt"], b["plan"]
+                    sim = simulate_trade(opt, plan, b["bars"], slip)
+                    if not sim:
+                        continue
+                    taken.add((vname, a["sym"], side, day))
+                    px_out, reason, t_out = sim
+                    pnl = (px_out - plan["entry"]) * CONTRACT_SIZE - 2 * commission
+                    pa_dir = 0 if a["pa_s"] == 0 else (1 if a["pa_s"] > 0 else -1)
+                    rows.append(dict(variant=vname, date=str(day), scan=label, symbol=a["sym"], side=side,
+                                     score=a["score"], strong=abs(a["score"]) >= STRONG_SCORE,
+                                     pa_points=a["pa_s"], pa_agrees=pa_dir == (1 if side == "CALL" else -1),
+                                     tags=" ".join(a["tags"]), strike=opt["strike"], expiry=opt["expiry"],
+                                     entry=plan["entry"], tp=plan["tp"], sl=plan["sl"], exit=round(px_out, 2),
+                                     reason=reason, exit_time=t_out.isoformat(), pnl=round(pnl, 2),
+                                     pnl_pct=round((px_out / plan["entry"] - 1) * 100, 1)))
+        if progress:
+            progress((di + 1) / len(test_days), f"Backtest day {di + 1}/{len(test_days)} ({day})")
+    return pd.DataFrame(rows)
+
+
+def summarize(tr):
+    """Headline numbers for a set of trades (pnl in $ per 1 lot, after slippage and commission)."""
+    if tr is None or tr.empty:
+        return {}
+    tr = tr.sort_values("exit_time")
+    win, loss = tr[tr["pnl"] > 0]["pnl"], tr[tr["pnl"] <= 0]["pnl"]
+    eq = pd.concat([pd.Series([0.0]), tr["pnl"].cumsum().reset_index(drop=True)])
+    gl = abs(loss.sum())
+    return {"Trades": len(tr),
+            "Win rate %": round(len(win) / len(tr) * 100, 1),
+            "Total P&L $": round(tr["pnl"].sum(), 0),
+            "Avg P&L $": round(tr["pnl"].mean(), 1),
+            "Avg win $": round(win.mean(), 1) if len(win) else 0.0,
+            "Avg loss $": round(loss.mean(), 1) if len(loss) else 0.0,
+            "Profit factor": round(win.sum() / gl, 2) if gl > 0 else float("inf"),
+            "Max drawdown $": round((eq - eq.cummax()).min(), 0),
+            "TP hits": int((tr["reason"] == "TP").sum()),
+            "SL hits": int((tr["reason"] == "SL").sum()),
+            "Time exits": int((tr["reason"] == "TIME").sum())}
+
+
+def _breakdown(tr, col):
+    g = tr.groupby(col)["pnl"]
+    out = pd.DataFrame({"trades": g.size(), "win %": g.apply(lambda x: round((x > 0).mean() * 100, 1)),
+                        "total $": g.sum().round(0), "avg $": g.mean().round(1)})
+    return out
+
 # ----------------------------- TELEGRAM TEXT (compact) -----------------------------
 
 def telegram_text(res):
@@ -586,6 +955,9 @@ def telegram_text(res):
             f"Δ{o['delta']:.2f} Γ{o['gamma']:.3f} Θ{o['theta']:.2f} V{o['vega']:.2f} ρ{o['rho']:.2f} IV{o['iv'] * 100:.0f}%",
             f"Stock {a['spot']:.2f} → day est {a['pred_close']:.2f} (H {a['pred_high']:.2f} / L {a['pred_low']:.2f})",
         ]
+        pa_txt = " ".join(t.replace("PA:", "") for t in a["pa_tags"] + (["PA:blocked"] if "PA:blocked" in a["tags"] else []))
+        if pa_txt:
+            lines.append(f"Price action: {a['pa']['struct']} | {pa_txt}")
     if not shown:
         lines.append("No qualifying setup this scan.")
     return "\n".join(lines)
@@ -734,6 +1106,12 @@ def draw_box(item, side, is_top):
                 st.write(f"High / low est: {a['pred_high']:.2f} / {a['pred_low']:.2f}")
                 st.write(f"RSI {a['rsi']:.0f} | RVOL {a['rvol']:.1f}x")
                 st.write(f"Daily ATR: {a['day_atr']:.2f}")
+            pa = a["pa"]
+            room = pa["room_up"] if side == "CALL" else pa["room_dn"]
+            room_txt = f"{room:.2f} to the next {'resistance' if side == 'CALL' else 'support'}" if room is not None else "open space ahead"
+            st.write(f"**Price action:** {pa['struct']} | candle: {pa['candle']} | "
+                     f"PDH {pa['pdh']:.2f} / PDL {pa['pdl']:.2f} | {room_txt}"
+                     f"{' | BLOCKED (level too close)' if 'PA:blocked' in a['tags'] else ''}")
             st.write(f"**Reward:Risk {p['rr']}** | stock stop {p['stock_sl']} / stock target {p['stock_tp']}")
             st.write(f"**Take profit ${p['tp']:.2f} -> +${p['profit_1lot']:,.0f} per lot** | "
                      f"stop loss ${p['sl']:.2f} -> -${p['loss_1lot']:,.0f} per lot")
@@ -763,6 +1141,100 @@ def render_scan(res, empty_msg):
         if res.get("table"):
             st.dataframe(pd.DataFrame(res["table"]).sort_values("score", key=abs, ascending=False))
 
+
+# ----- backtest tab -----
+def show_backtest(tr):
+    if tr is None or tr.empty:
+        st.info("No trades found in that period.")
+        return
+    summ = {v: summarize(g) for v, g in tr.groupby("variant")}
+    order = [v for v in ("Price action", "Indicators only") if v in summ]
+    cols = st.columns(len(order))
+    for c, v in zip(cols, order):
+        s = summ[v]
+        with c:
+            st.markdown(f"**{v}**")
+            st.metric("Total P&L (1 lot)", f"${s['Total P&L $']:,.0f}")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Trades", s["Trades"])
+            m2.metric("Win rate", f"{s['Win rate %']}%")
+            m3.metric("Profit factor", s["Profit factor"])
+    st.dataframe(pd.DataFrame(summ).T.loc[order])
+
+    eq = {}
+    for v in order:
+        g = tr[tr["variant"] == v].sort_values("exit_time")
+        eq[v] = g["pnl"].cumsum().reset_index(drop=True)
+    st.markdown("**Equity curve ($ per 1 lot, trade by trade)**")
+    st.line_chart(pd.DataFrame(eq))
+
+    main_v = order[0]
+    g = tr[tr["variant"] == main_v]
+    b1, b2 = st.columns(2)
+    with b1:
+        st.markdown(f"**{main_v} - by scan**")
+        st.dataframe(_breakdown(g, "scan"))
+        st.markdown(f"**{main_v} - by side**")
+        st.dataframe(_breakdown(g, "side"))
+    with b2:
+        st.markdown(f"**{main_v} - by signal strength (strong = |score| >= {STRONG_SCORE})**")
+        st.dataframe(_breakdown(g, "strong"))
+        st.markdown(f"**{main_v} - price action agreed with the trade direction**")
+        st.dataframe(_breakdown(g, "pa_agrees"))
+    with st.expander("All trades"):
+        st.dataframe(tr.sort_values(["date", "exit_time"]))
+
+
+def render_backtest_tab():
+    st.caption("Replays the scheduled scans on past days (no look-ahead) with the same scoring, trade plan and exits. "
+               "yfinance keeps only 60 days of 5-minute data and no option history, so the option is MODELLED with "
+               "Black-Scholes (strike nearest delta 0.65, next Friday expiry, IV = 20-day HV x multiplier, constant IV). "
+               "Stop loss is checked before take profit inside the same bar. Results are estimates, not a promise. "
+               "While it runs (a few minutes) the live auto-scan loop is paused.")
+    c1, c2, c3, c4 = st.columns(4)
+    days = c1.slider("Trading days", 5, 40, 20)
+    iv_mult = c2.slider("Option IV vs 20-day HV (x)", 0.8, 1.6, BT_IV_MULT, 0.05)
+    slip = c3.slider("Slippage per side (%)", 0.0, 5.0, BT_SLIPPAGE * 100, 0.5) / 100
+    comm = c4.number_input("Commission $/contract/side", 0.0, 5.0, BT_COMMISSION, 0.05)
+    nsym = st.slider("Stocks", 10, len(SYMBOLS), len(SYMBOLS), 5)
+
+    if st.button("Run backtest", type="primary"):
+        bar = st.progress(0.0, text="Starting...")
+        cb = lambda f, t: bar.progress(min(max(f, 0.0), 1.0), text=t)
+        data = fetch_history(SYMBOLS[:nsym], cb)
+        if not data:
+            bar.empty()
+            st.error("Could not download history from yfinance.")
+        else:
+            tr = run_backtest(data, days, iv_mult, slip, comm, cb)
+            bar.empty()
+            if not tr.empty:
+                tr.to_csv(BT_FILE, index=False)
+            st.session_state["bt"] = tr
+    tr = st.session_state.get("bt")
+    if tr is None and os.path.exists(BT_FILE):
+        tr = pd.read_csv(BT_FILE)
+        st.caption(f"Showing the last saved backtest ({BT_FILE}).")
+    if tr is not None:
+        show_backtest(tr)
+
+
+def cli_backtest(days):
+    print(f"Downloading history for {len(SYMBOLS)} stocks ...")
+    data = fetch_history(SYMBOLS, lambda f, t: None)
+    print(f"{len(data)} stocks with data. Running {days}-day backtest ...")
+    tr = run_backtest(data, days)
+    if tr.empty:
+        print("No trades.")
+        return
+    tr.to_csv(BT_FILE, index=False)
+    pd.set_option("display.width", 200)
+    print(pd.DataFrame({v: summarize(g) for v, g in tr.groupby("variant")}).T.to_string())
+    for v, g in tr.groupby("variant"):
+        print(f"\n--- {v}: by scan ---")
+        print(_breakdown(g, "scan").to_string())
+    print(f"\nTrades saved to {BT_FILE}")
+
 # ----------------------------- STREAMLIT UI -----------------------------
 
 def main():
@@ -771,7 +1243,7 @@ def main():
 
     st.title("📈 US Top-50 Call / Put Scanner")
     st.caption("Scans: premarket 09:00 ET, open +10 min 09:40 ET, then every hour 10:40-14:40 ET - each one is sent to "
-               "Telegram. Next expiry (not same day) - all Greeks - educational only, not advice.")
+               "Telegram. Next expiry (not same day) - all Greeks + price action - educational only, not advice.")
 
     with st.sidebar:
         auto = st.toggle("Auto scans (see schedule)", value=True)
@@ -827,7 +1299,8 @@ def main():
         a, b = scheduled.get(key), manual.get(mode)
         return max([x for x in (a, b) if ok(x)], key=when_of) if (ok(a) or ok(b)) else (state.get(key) or None)
 
-    t_latest, t_pre, t_open, t_hour = st.tabs(["Latest scan", "Premarket", "Open +10min", "Hourly scans"])
+    t_latest, t_pre, t_open, t_hour, t_bt = st.tabs(["Latest scan", "Premarket", "Open +10min", "Hourly scans",
+                                                     "Backtest"])
     with t_latest:
         render_scan(latest, "No scan yet - the first one runs at 09:00 ET (or use a manual run).")
     with t_pre:
@@ -842,6 +1315,8 @@ def main():
             render_scan(hourly[names.index(pick)], "")
         else:
             st.info("No hourly scan yet - they run at 10:40, 11:40, 12:40, 13:40 and 14:40 ET.")
+    with t_bt:
+        render_backtest_tab()
 
     if auto:
         box = st.empty()
@@ -857,4 +1332,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--backtest" in sys.argv:
+        i = sys.argv.index("--backtest")
+        cli_backtest(int(sys.argv[i + 1]) if len(sys.argv) > i + 1 and sys.argv[i + 1].isdigit() else 20)
+    else:
+        main()
