@@ -35,7 +35,7 @@ import math
 import time
 import datetime as dt
 from zoneinfo import ZoneInfo
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -745,22 +745,27 @@ def run_scheduled(cfg):
 
 def fetch_history(symbols, progress=None):
     """{symbol: (5-min bars incl. premarket, last 60 days ; daily bars, 6 months)}"""
-    out, done = {}, [0]
+    out = {}
 
     def one(sym):
+        # worker thread: download only - no Streamlit calls here (they fail outside the script thread)
         try:
             df = _clean_intraday(yf.Ticker(sym).history(period="60d", interval="5m", prepost=True))
             dd = fetch_daily(sym, period="6mo")
             if df is not None and dd is not None and len(df) > 200:
-                out[sym] = (df, dd)
+                return sym, (df, dd)
         except Exception:
             pass
-        done[0] += 1
-        if progress:
-            progress(done[0] / len(symbols), f"Downloading history {done[0]}/{len(symbols)}")
+        return sym, None
 
     with ThreadPoolExecutor(max_workers=6) as ex:
-        list(ex.map(one, symbols))
+        futures = [ex.submit(one, s) for s in symbols]
+        for n, fut in enumerate(as_completed(futures), 1):      # progress is reported from the main thread
+            sym, val = fut.result()
+            if val is not None:
+                out[sym] = val
+            if progress:
+                progress(n / len(symbols), f"Downloading history {n}/{len(symbols)}")
     return out
 
 
