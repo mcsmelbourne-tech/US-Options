@@ -1,5 +1,5 @@
 """
-US Top-25 Call/Put Scanner - two scans per US trading day (yfinance + Greeks)
+US Top-50 Call/Put Scanner - two scans per US trading day (yfinance + Greeks)
 
   Scan 1  PREMARKET   09:00 ET  - gap, premarket range/volume, trend; option prices are indicative
   Scan 2  OPEN +10min 09:40 ET  - re-scores everything, ADDS the premarket scan result
@@ -50,7 +50,7 @@ CONTRACT_SIZE = 100                          # 1 lot = 1 contract = 100 shares
 
 MIN_SCORE = 3                                # minimum |score| to be considered
 STRONG_SCORE = 5                             # |score| for a "strong" signal
-CANDIDATES = 10                              # stocks (best scores) whose option chains are checked
+CANDIDATES = 12                              # stocks (best scores) whose option chains are checked
 
 # option filters / ranking
 TARGET_DELTA = 0.65
@@ -70,6 +70,11 @@ SYMBOLS = [
     "V", "PG", "JPM", "HD", "MA",
     "XOM", "BAC", "PFE", "KO", "PEP",
     "CSCO", "ABBV", "ADBE", "NFLX", "CRM",
+    "LLY", "AVGO", "COST", "WMT", "ORCL",
+    "MRK", "TMO", "ACN", "MCD", "LIN",
+    "ABT", "WFC", "DIS", "DHR", "TXN",
+    "QCOM", "AMD", "INTC", "IBM", "GS",
+    "CAT", "AMGN", "HON", "UNP", "LOW",
 ]
 
 # ----------------------------- CONFIG / STATE / TELEGRAM -----------------------------
@@ -440,7 +445,7 @@ def log_picks(res):
 
 def scan_once(mode, pre_prev=None):
     now = dt.datetime.now(ET)
-    with ThreadPoolExecutor(max_workers=5) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         analysed = [a for a in ex.map(lambda s: analyse(s, mode, pre_prev), SYMBOLS) if a]
 
     table = [dict(symbol=a["sym"], price=round(a["spot"], 2), gap_pct=round(a["gap"], 2), rsi=round(a["rsi"], 1),
@@ -460,7 +465,7 @@ def scan_once(mode, pre_prev=None):
         rank = abs(a["score"]) * 10 + opt["quality"] * 0.25 + min(plan["rr"], 3.0) * 5
         return dict(side=side, a=a, opt=opt, plan=plan, rank=rank, strong=abs(a["score"]) >= STRONG_SCORE)
 
-    with ThreadPoolExecutor(max_workers=5) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         built = [b for b in ex.map(build, cands) if b]
 
     res = {"mode": mode, "time": now.isoformat(timespec="seconds"), "CALL": None, "PUT": None, "top": None,
@@ -725,7 +730,7 @@ def render_scan(res, empty_msg):
     when = dt.datetime.fromisoformat(res["time"])
     tg = " | Telegram sent ✅" if res.get("telegram") else ""
     st.write(f"Scan time: **{when.strftime('%a %d %b %H:%M')} ET** ({fmt_local(when)} your time) | "
-             f"{res.get('scanned', '?')}/25 stocks read{tg}")
+             f"{res.get('scanned', '?')}/{len(SYMBOLS)} stocks read{tg}")
     draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL")
     draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT")
     with st.expander("All stocks - direction score & day estimate"):
@@ -738,7 +743,7 @@ def main():
     st.set_page_config(page_title="US Call/Put Scanner", layout="wide")
     cfg = load_config()
 
-    st.title("📈 US Top-25 Call / Put Scanner")
+    st.title("📈 US Top-50 Call / Put Scanner")
     st.caption("2 scans per US trading day: premarket (09:00 ET) and open +10 min (09:40 ET, includes premarket result). "
                "Next expiry (not same day) - all Greeks - educational only, not advice.")
 
@@ -764,7 +769,7 @@ def main():
     manual = st.session_state.setdefault("manual", {})
     if run_pre or run_open:
         mode = "open" if run_open else "pre"
-        with st.spinner("Scanning 25 stocks..."):
+        with st.spinner(f"Scanning {len(SYMBOLS)} stocks..."):
             manual[mode] = scan_once(mode, pre_scores_today(load_state()) if mode == "open" else None)
 
     state = load_state()
