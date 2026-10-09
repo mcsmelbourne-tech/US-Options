@@ -88,9 +88,13 @@ MIN_OI = 100
 
 # trade plan (stock based, converted to option prices with the Greeks / Black-Scholes)
 HOLD_HOURS = 6.0                             # time decay assumed before exit
+TP_FRAC = 1.0                                # stock target = this x the expected move (smaller = closer target, higher win rate)
 SL_MOVE_FRAC = 0.5                           # stock stop = 50% of the expected move against the trade
 MIN_LOSS, MAX_LOSS = 0.10, 0.30              # option stop loss clamped to 10-30% of premium
 MIN_RR = 1.3                                 # skip trades with reward:risk below this
+REQUIRE_PA = False                           # True = only trade when price action points the same way as the trade
+# TP_FRAC / SL_MOVE_FRAC / MAX_LOSS / MIN_SCORE / MIN_RR / REQUIRE_PA are what the Backtest tab's "Sweep" tunes -
+# copy the values it finds here (live scans and the backtest both read these).
 
 # price action
 SWING_K = 3                                  # a swing high/low = extreme of 3 bars either side (5-min bars)
@@ -578,21 +582,26 @@ def pick_option(sym, spot, side, hv):
         return None
 
 
-def trade_plan(opt, a):
+def trade_plan(opt, a, tp_frac=None, sl_frac=None, min_loss=None, max_loss=None):
     """Stock targets from the day prediction, converted to option prices with Black-Scholes.
-       With price action on, the stock stop goes just beyond the last swing low (call) / swing high (put)."""
+       With price action on, the stock stop goes just beyond the last swing low (call) / swing high (put).
+       tp_frac / sl_frac / min_loss / max_loss default to the settings at the top of the file."""
+    tp_frac = TP_FRAC if tp_frac is None else tp_frac
+    sl_frac = SL_MOVE_FRAC if sl_frac is None else sl_frac
+    min_loss = MIN_LOSS if min_loss is None else min_loss
+    max_loss = MAX_LOSS if max_loss is None else max_loss
     side = opt["side"]
     sign = 1 if side == "CALL" else -1
     S, K, T, iv = a["spot"], opt["strike"], opt["T"], opt["iv"]
     T_exit = max(T - HOLD_HOURS / (24 * 365), 1.0 / (24 * 365))
 
     now_px = bs_price(S, K, T, iv, side)
-    stock_tp = S + sign * a["move"]
-    stock_sl = S - sign * a["move"] * SL_MOVE_FRAC
+    stock_tp = S + sign * a["move"] * tp_frac
+    stock_sl = S - sign * a["move"] * sl_frac
     ref = a.get("sl_ref")
     if ref is not None:                                   # structural stop, kept within a sensible distance
         dist = abs(S - ref) + 0.1 * a["atr5"]
-        if 0.25 * a["move"] <= dist <= 1.0 * a["move"]:
+        if 0.25 * a["move"] <= dist <= max(1.0, sl_frac) * a["move"]:
             stock_sl = S - sign * dist
     gain = bs_price(stock_tp, K, T_exit, iv, side) - now_px
     loss = now_px - bs_price(stock_sl, K, T_exit, iv, side)
@@ -600,7 +609,7 @@ def trade_plan(opt, a):
     entry = opt["entry"]
     if gain <= 0:
         return None
-    loss = min(max(loss, entry * MIN_LOSS), entry * MAX_LOSS)
+    loss = min(max(loss, entry * min_loss), entry * max_loss)
 
     entry_r = round(entry, 2)
     tp = round(entry + gain, 2)
