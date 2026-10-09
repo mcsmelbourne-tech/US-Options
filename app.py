@@ -1055,6 +1055,7 @@ def telegram_text(res):
             f"Δ{o['delta']:.2f} Γ{o['gamma']:.3f} Θ{o['theta']:.2f} V{o['vega']:.2f} ρ{o['rho']:.2f} IV{o['iv'] * 100:.0f}%",
             f"Stock {a['spot']:.2f} → day est {a['pred_close']:.2f} (H {a['pred_high']:.2f} / L {a['pred_low']:.2f})",
         ]
+        lines.append(f"Chart: {tv_url(o['symbol'])}")
         pa_txt = " ".join(t.replace("PA:", "") for t in a["pa_tags"] + (["PA:blocked"] if "PA:blocked" in a["tags"] else []))
         if pa_txt:
             lines.append(f"Price action: {a['pa']['struct']} | {pa_txt}")
@@ -1066,6 +1067,11 @@ def telegram_text(res):
 
 def fmt_local(when):
     return when.astimezone(LOCAL_TZ).strftime("%a %d %b %H:%M")
+
+
+def tv_url(sym, interval="5"):
+    """TradingView chart for the stock (5-minute by default). Yahoo's BRK-B style becomes BRK.B."""
+    return f"https://www.tradingview.com/chart/?symbol={sym.replace('-', '.')}&interval={interval}"
 
 
 # ----- Moomoo-style order ticket (dark panel, inline styles only) -----
@@ -1147,7 +1153,8 @@ def order_ticket_html(item):
         f'<div style="background:{_BG};border-radius:8px;padding:14px 16px;max-width:340px;'
         f'font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:{_TXT}">'
         f'<div style="font-size:16px;font-weight:600">Trade</div>'
-        f'<div style="color:{_MUT};font-size:12px;margin-top:2px">{o["symbol"]} - {o["side"]} - scanner values</div>'
+        f'<div style="font-size:12px;margin-top:2px"><a href="{tv_url(o["symbol"])}" target="_blank" rel="noopener" '
+        f'style="color:{_BLU};text-decoration:none">{o["symbol"]} - {o["side"]} - open chart in TradingView &#8599;</a></div>'
         f'{tabs}{contract_side}'
         f'{_lab("Session")}{_box("RTH only", color=_MUT)}'
         f'{_lab("Order Type")}{_box("Limit<span style=float:right>&#8964;</span>")}'
@@ -1175,6 +1182,11 @@ def draw_box(item, side, is_top):
     o, p, a = item["opt"], item["plan"], item["a"]
     with st.container(border=True):
         st.subheader(f"{icon} {side} - {o['symbol']}" + ("   ⭐ TOP PICK" if is_top else ""))
+        link = tv_url(o["symbol"])
+        try:
+            st.link_button(f"📈 Open {o['symbol']} chart in TradingView", link)
+        except AttributeError:                                  # older Streamlit
+            st.markdown(f"[📈 Open {o['symbol']} chart in TradingView]({link})")
         pre = f" | premarket scan score {a['pre_score']}" if a.get("pre_score") is not None else ""
         st.caption(f"{'STRONG' if item['strong'] else 'Moderate'} signal | score {a['score']}{pre} | "
                    f"{' '.join(a['tags'])}")
