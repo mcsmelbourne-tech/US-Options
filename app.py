@@ -1,9 +1,11 @@
 """
-US Top-50 Call/Put Scanner - two scans per US trading day (yfinance + Greeks)
+US Top-50 Call/Put Scanner - scheduled scans every US trading day (yfinance + Greeks)
 
-  Scan 1  PREMARKET   09:00 ET  - gap, premarket range/volume, trend; option prices are indicative
-  Scan 2  OPEN +10min 09:40 ET  - re-scores everything, ADDS the premarket scan result
+  Scan 1  PREMARKET    09:00 ET - gap, premarket range/volume, trend; option prices are indicative
+  Scan 2  OPEN +10min  09:40 ET - re-scores everything, ADDS the premarket scan result
                                   (opening-range breakout vs premarket high/low, direction consistency)
+  Scan 3+ HOURLY       10:40, 11:40, 12:40, 13:40, 14:40 ET - fresh picks through the day (volume is judged
+                                  against the time of day; 14:40 is the last, trades exit by 15:45 ET)
 
 Per stock: EMA 9 / EMA 15, RSI, MACD, volume (relative to normal), ATR, VWAP, gap.
 Per option: Black-Scholes Greeks (delta, gamma, theta, vega, rho) from yfinance implied vol,
@@ -44,6 +46,20 @@ SCAN_OPEN_TIME = dt.time(9, 40)              # 10 min after the 09:30 open (ET)
 SCAN_OPEN_LATEST = dt.time(10, 30)           # if the app starts late, still run the open scan until here
 MARKET_OPEN = dt.time(9, 30)
 MARKET_CLOSE = dt.time(16, 0)
+HOURLY_TIMES = [dt.time(h, 40) for h in range(10, 15)]   # 10:40 ... 14:40 ET, every hour after the open scan
+HOURLY_GRACE_MIN = 20                                    # a late start can still run an hourly scan this long after its time
+
+
+def _plus(t, minutes):
+    return (dt.datetime.combine(dt.date(2000, 1, 1), t) + dt.timedelta(minutes=minutes)).time()
+
+
+# (key, mode, start time ET, latest start ET, label) - in time order
+SCHEDULE = (
+    [("pre", "pre", SCAN_PRE_TIME, MARKET_OPEN, "Premarket"),
+     ("open", "open", SCAN_OPEN_TIME, SCAN_OPEN_LATEST, "Open +10min")]
+    + [(f"h{t:%H%M}", "hourly", t, _plus(t, HOURLY_GRACE_MIN), f"Hourly {t:%H:%M}") for t in HOURLY_TIMES]
+)
 
 RISK_FREE = 0.04
 CONTRACT_SIZE = 100                          # 1 lot = 1 contract = 100 shares
@@ -228,7 +244,7 @@ def fetch_daily(sym):
 # ----------------------------- STOCK ANALYSIS + DAY PREDICTION -----------------------------
 
 def analyse(sym, mode, pre_prev):
-    """mode: 'pre' or 'open'. pre_prev: {symbol: score} from today's premarket scan (or None)."""
+    """mode: 'pre', 'open' or 'hourly'. pre_prev: {symbol: score} from today's premarket scan (or None)."""
     try:
         df, dd = fetch_intraday(sym), fetch_daily(sym)
         if df is None or dd is None or len(df) < 40:
@@ -270,8 +286,13 @@ def analyse(sym, mode, pre_prev):
         day_open = float(reg["open"].iloc[0]) if len(reg) else (float(pm["close"].iloc[-1]) if len(pm) else spot)
         gap = (day_open - prev_close) / prev_close * 100
 
-        if mode == "open" and len(reg) > 0 and avg_vol > 0:
-            rvol = reg_vol / (avg_vol * 0.07)       # first ~10 min normally ~7% of the day's volume
+        if mode != "pre" and len(reg) > 0 and avg_vol > 0:
+            last_bar = df.index[-1]
+            elapsed = (last_bar.hour * 60 + last_bar.minute + 5) - (9 * 60 + 30)       # minutes since the open
+            # typical share of the day's volume traded by then (U-shaped intraday curve)
+            frac = float(np.interp(elapsed, [0, 10, 30, 60, 120, 180, 240, 300, 360, 390],
+                                   [0, 0.07, 0.16, 0.26, 0.40, 0.50, 0.60, 0.72, 0.85, 1.0]))
+            rvol = reg_vol / (avg_vol * max(frac, 0.02))
         elif avg_vol > 0:
             rvol = pm_vol / (avg_vol * 0.03)        # premarket normally ~3% of the day's volume
         else:
@@ -294,9 +315,11 @@ def analyse(sym, mode, pre_prev):
         add(int(np.sign(gap)) if abs(gap) >= 0.5 else 0, "Gap")
         mom = (spot - float(close.iloc[-7])) / atr5
         add(1 if mom > 0.7 else (-1 if mom < -0.7 else 0), "Mom")
-        if mode == "open" and len(reg) > 0 and pm_high is not None:
+        if mode != "pre" and len(reg) > 0 and pm_high is not None:
             add(1 if spot > pm_high else (-1 if spot < pm_low else 0), "PM-break")
-        if mode == "open" and pre_prev and pre_prev.get(sym) and s != 0:
+        if mode != "pre" and len(reg) > 0 and abs(spot - day_open) > 0.25 * atr5:
+            add(1 if spot > day_open else -1, "vsOpen")
+        if mode != "pre" and pre_prev and pre_prev.get(sym) and s != 0:
             # premarket scan agreed with today's direction -> strengthen it; disagreed -> weaken it
             agree = (pre_prev[sym] > 0) == (s > 0)
             add((1 if s > 0 else -1) * (1 if agree else -1), "PM-scan")
@@ -435,7 +458,7 @@ def log_picks(res):
             if not it:
                 continue
             o, p, a = it["opt"], it["plan"], it["a"]
-            w.writerow([res["time"], res["mode"], o["symbol"], side, o["expiry"], o["strike"], round(a["spot"], 2),
+            w.writerow([res["time"], res["label"], o["symbol"], side, o["expiry"], o["strike"], round(a["spot"], 2),
                         round(a["pred_close"], 2), round(a["pred_high"], 2), round(a["pred_low"], 2),
                         p["entry"], p["sl"], p["tp"], p["profit_1lot"], round(o["delta"], 3), round(o["gamma"], 4),
                         round(o["theta"], 3), round(o["vega"], 3), round(o["rho"], 3), round(o["iv"], 3),
@@ -443,7 +466,7 @@ def log_picks(res):
 
 # ----------------------------- SCAN -----------------------------
 
-def scan_once(mode, pre_prev=None):
+def scan_once(mode, pre_prev=None, label=None):
     now = dt.datetime.now(ET)
     with ThreadPoolExecutor(max_workers=6) as ex:
         analysed = [a for a in ex.map(lambda s: analyse(s, mode, pre_prev), SYMBOLS) if a]
@@ -468,7 +491,8 @@ def scan_once(mode, pre_prev=None):
     with ThreadPoolExecutor(max_workers=6) as ex:
         built = [b for b in ex.map(build, cands) if b]
 
-    res = {"mode": mode, "time": now.isoformat(timespec="seconds"), "CALL": None, "PUT": None, "top": None,
+    res = {"mode": mode, "label": label or {"pre": "Premarket", "open": "Open +10min", "hourly": "Hourly"}[mode],
+           "time": now.isoformat(timespec="seconds"), "CALL": None, "PUT": None, "top": None,
            "table": table, "scores": {a["sym"]: a["score"] for a in analysed}, "scanned": len(analysed)}
     for b in built:
         if res[b["side"]] is None or b["rank"] > res[b["side"]]["rank"]:
@@ -486,13 +510,14 @@ def _done(state, key, today):
 
 
 def due_scan(now, state):
+    """The SCHEDULE entry that should start now (and has not run yet today), else None."""
     if now.weekday() >= 5:
         return None
     t, today = now.time(), str(now.date())
-    if SCAN_OPEN_TIME <= t < SCAN_OPEN_LATEST and not _done(state, "open", today):
-        return "open"
-    if SCAN_PRE_TIME <= t < MARKET_OPEN and not _done(state, "pre", today):
-        return "pre"
+    for entry in SCHEDULE:
+        key, _, start, latest, _ = entry
+        if start <= t < latest and not _done(state, key, today):
+            return entry
     return None
 
 
@@ -501,10 +526,10 @@ def next_scan(now):
         day = now.date() + dt.timedelta(days=i)
         if day.weekday() >= 5:
             continue
-        for key, t in (("pre", SCAN_PRE_TIME), ("open", SCAN_OPEN_TIME)):
-            when = dt.datetime.combine(day, t, tzinfo=ET)
+        for entry in SCHEDULE:
+            when = dt.datetime.combine(day, entry[2], tzinfo=ET)
             if when > now:
-                return key, when
+                return entry, when
     return None, None
 
 
@@ -520,31 +545,32 @@ def run_scheduled(cfg):
     """Runs a due scan once (state file stops repeats, also across several browser tabs)."""
     now = dt.datetime.now(ET)
     state = load_state()
-    mode = due_scan(now, state)
-    if not mode:
+    entry = due_scan(now, state)
+    if not entry:
         return None
+    key, mode, _, _, label = entry
     today = str(now.date())
     if state.get("date") != today:
         state = {"date": today}
-    state[mode] = {"running": True, "time": now.isoformat(timespec="seconds")}   # claim it
+    state[key] = {"running": True, "time": now.isoformat(timespec="seconds"), "label": label}   # claim it
     save_state(state)
     try:
-        res = scan_once(mode, pre_scores_today(state) if mode == "open" else None)
-        state[mode] = res
+        res = scan_once(mode, pre_scores_today(state) if mode != "pre" else None, label)
+        state[key] = res
         save_state(state)
         res["telegram"] = send_telegram(cfg, telegram_text(res))
-        state[mode] = res
+        state[key] = res
         save_state(state)
     except Exception as e:
-        state[mode] = {"error": str(e), "time": now.isoformat(timespec="seconds"), "mode": mode}
+        state[key] = {"error": str(e), "time": now.isoformat(timespec="seconds"), "mode": mode, "label": label}
         save_state(state)
-    return mode
+    return key
 
 # ----------------------------- TELEGRAM TEXT (compact) -----------------------------
 
 def telegram_text(res):
     when = dt.datetime.fromisoformat(res["time"])
-    title = "PREMARKET (indicative)" if res["mode"] == "pre" else "OPEN +10min"
+    title = "PREMARKET (indicative)" if res["mode"] == "pre" else res.get("label", "SCAN").upper()
     lines = [f"📊 {title} · {when.strftime('%H:%M')} ET"]
     shown = False
     for side in ("CALL", "PUT"):
@@ -744,11 +770,11 @@ def main():
     cfg = load_config()
 
     st.title("📈 US Top-50 Call / Put Scanner")
-    st.caption("2 scans per US trading day: premarket (09:00 ET) and open +10 min (09:40 ET, includes premarket result). "
-               "Next expiry (not same day) - all Greeks - educational only, not advice.")
+    st.caption("Scans: premarket 09:00 ET, open +10 min 09:40 ET, then every hour 10:40-14:40 ET - each one is sent to "
+               "Telegram. Next expiry (not same day) - all Greeks - educational only, not advice.")
 
     with st.sidebar:
-        auto = st.toggle("Auto scans (09:00 & 09:40 ET)", value=True)
+        auto = st.toggle("Auto scans (see schedule)", value=True)
         with st.expander("Telegram"):
             bot = st.text_input("Bot token", value=cfg.get("telegram_bot_token", ""), type="password")
             chat = st.text_input("Chat ID", value=cfg.get("telegram_chat_id", ""))
@@ -762,29 +788,60 @@ def main():
         st.markdown("**Manual run** (screen only, no Telegram)")
         run_pre = st.button("Premarket scan now")
         run_open = st.button("Open scan now")
+        run_hourly = st.button("Hourly-style scan now")
 
     if auto:
         run_scheduled(cfg)
 
     manual = st.session_state.setdefault("manual", {})
-    if run_pre or run_open:
-        mode = "open" if run_open else "pre"
-        with st.spinner(f"Scanning {len(SYMBOLS)} stocks..."):
-            manual[mode] = scan_once(mode, pre_scores_today(load_state()) if mode == "open" else None)
+    for flag, mode, label in ((run_pre, "pre", "Premarket (manual)"), (run_open, "open", "Open +10min (manual)"),
+                              (run_hourly, "hourly", "Hourly (manual)")):
+        if flag:
+            with st.spinner(f"Scanning {len(SYMBOLS)} stocks..."):
+                manual[mode] = scan_once(mode, pre_scores_today(load_state()) if mode != "pre" else None, label)
 
     state = load_state()
+    now = dt.datetime.now(ET)
+    today = str(now.date())
 
-    def newest(key):
-        a, b = state.get(key), manual.get(key)
-        if a and b and not a.get("running") and not a.get("error"):
-            return b if b["time"] > a["time"] else a
-        return a or b
+    def ok(r):
+        return isinstance(r, dict) and r.get("time") and not r.get("running") and not r.get("error")
 
-    tab_open, tab_pre = st.tabs(["Open scan (09:40 ET)", "Premarket scan (09:00 ET)"])
-    with tab_open:
-        render_scan(newest("open"), "No open scan yet - runs automatically at 09:40 ET (or use 'Open scan now').")
-    with tab_pre:
-        render_scan(newest("pre"), "No premarket scan yet - runs automatically at 09:00 ET (or use 'Premarket scan now').")
+    def when_of(r):
+        return dt.datetime.fromisoformat(r["time"])
+
+    scheduled = {k: v for k, v in state.items() if k != "date" and ok(v)}
+    everything = list(scheduled.values()) + [r for r in manual.values() if ok(r)]
+    latest = max(everything, key=when_of) if everything else None
+
+    # today's schedule at a glance
+    marks = []
+    for key, _, start, _, label in SCHEDULE:
+        if _done(state, key, today):
+            marks.append(f"✅ {start:%H:%M}")
+        else:
+            marks.append(f"⏳ {start:%H:%M}")
+    st.caption("Today (ET): " + "  ".join(marks))
+
+    def newest(key, mode):
+        a, b = scheduled.get(key), manual.get(mode)
+        return max([x for x in (a, b) if ok(x)], key=when_of) if (ok(a) or ok(b)) else (state.get(key) or None)
+
+    t_latest, t_pre, t_open, t_hour = st.tabs(["Latest scan", "Premarket", "Open +10min", "Hourly scans"])
+    with t_latest:
+        render_scan(latest, "No scan yet - the first one runs at 09:00 ET (or use a manual run).")
+    with t_pre:
+        render_scan(newest("pre", "pre"), "No premarket scan yet - runs at 09:00 ET.")
+    with t_open:
+        render_scan(newest("open", "open"), "No open scan yet - runs at 09:40 ET.")
+    with t_hour:
+        hourly = sorted([r for r in everything if r.get("mode") == "hourly"], key=when_of, reverse=True)
+        if hourly:
+            names = [f"{h.get('label', 'Hourly')} - {when_of(h):%a %H:%M} ET" for h in hourly]
+            pick = st.selectbox("Hourly scan", names, index=0)
+            render_scan(hourly[names.index(pick)], "")
+        else:
+            st.info("No hourly scan yet - they run at 10:40, 11:40, 12:40, 13:40 and 14:40 ET.")
 
     if auto:
         box = st.empty()
@@ -792,10 +849,9 @@ def main():
             now = dt.datetime.now(ET)
             if due_scan(now, load_state()):
                 st.rerun()
-            key, when = next_scan(now)
+            entry, when = next_scan(now)
             left = int((when - now).total_seconds())
-            name = "Premarket scan" if key == "pre" else "Open scan"
-            box.caption(f"Next: **{name}** at {when.strftime('%a %H:%M')} ET ({fmt_local(when)} your time) - in "
+            box.caption(f"Next: **{entry[4]}** at {when.strftime('%a %H:%M')} ET ({fmt_local(when)} your time) - in "
                         f"{left // 3600}h {(left % 3600) // 60:02d}m {left % 60:02d}s. Keep this page open.")
             time.sleep(1)
 
