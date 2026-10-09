@@ -28,6 +28,7 @@ Educational use only - estimates are heuristics, not advice.
 """
 
 import csv
+import itertools
 import os
 import sys
 import json
@@ -51,6 +52,7 @@ LOG_FILE = "scan_log.csv"
 CONFIG_FILE = "config.json"
 STATE_FILE = "scan_state.json"
 BT_FILE = "backtest_trades.csv"
+SWEEP_FILE = "backtest_sweep.csv"
 
 SCAN_PRE_TIME = dt.time(9, 0)                # premarket scan (ET)
 SCAN_OPEN_TIME = dt.time(9, 40)              # 10 min after the 09:30 open (ET)
@@ -503,6 +505,11 @@ def finalize(a, use_pa=True, pre_prev=None):
     return a
 
 
+def pa_agrees(a):
+    """True when the price-action points add up in the same direction as the final score."""
+    return a["pa_s"] != 0 and (a["pa_s"] > 0) == (a["score"] > 0)
+
+
 def analyse(sym, mode, pre_prev):
     """Live analysis (current data) with price action on."""
     try:
@@ -653,7 +660,8 @@ def scan_once(mode, pre_prev=None, label=None):
                   rvol=round(a["rvol"], 2), score=a["score"], price_action=a["pa_s"], pre_score=a["pre_score"],
                   structure=a["pa"]["struct"], day_est=round(a["pred_close"], 2)) for a in analysed]
 
-    cands = sorted([a for a in analysed if abs(a["score"]) >= MIN_SCORE], key=lambda a: -abs(a["score"]))[:CANDIDATES]
+    cands = sorted([a for a in analysed if abs(a["score"]) >= MIN_SCORE and (not REQUIRE_PA or pa_agrees(a))],
+                   key=lambda a: -abs(a["score"]))[:CANDIDATES]
 
     def build(a):
         side = "CALL" if a["score"] > 0 else "PUT"
@@ -845,22 +853,19 @@ def simulate_trade(opt, plan, bars, slip):
     return val(last_close, last_end) * (1 - slip), "TIME", last_ts
 
 
-def run_backtest(data, days=20, iv_mult=BT_IV_MULT, slip=BT_SLIPPAGE, commission=BT_COMMISSION, progress=None):
-    """Returns a DataFrame with one row per trade, variant = 'Price action' or 'Indicators only'."""
+def prepare_backtest(data, days=20, progress=None):
+    """The slow part, done once: every stock's indicator + price-action read at every scan time of the last
+    `days` trading days (cut at the scan time, so no look-ahead). run_backtest() and the sweep reuse it."""
     if not data:
-        return pd.DataFrame()
+        return []
     today_et = dt.datetime.now(ET).date()
     ref = max(data.values(), key=lambda x: len(x[0]))[0]
     regr = ref[np.array([x >= MARKET_OPEN for x in ref.index.time])]
     full = [d for d, g in regr.groupby(regr.index.date)
             if d < today_et and len(g) >= 70 and g.index[-1].time() >= dt.time(15, 30)]
     test_days = full[-days:]
-    variants = {"Price action": True, "Indicators only": False}
-    rows = []
-
+    prep = []
     for di, day in enumerate(test_days):
-        pre_scores = {v: {} for v in variants}
-        taken = set()
         exit_ts = pd.Timestamp(dt.datetime.combine(day, EXIT_TIME), tz=ET)
         for key, mode, start, _, label in SCHEDULE:
             when = pd.Timestamp(dt.datetime.combine(day, start), tz=ET)
@@ -871,55 +876,136 @@ def run_backtest(data, days=20, iv_mult=BT_IV_MULT, slip=BT_SLIPPAGE, commission
                 a0 = analyse_df(sym, df.iloc[max(0, i - 720):i], dd, mode)
                 if a0:
                     base.append(a0)
-
-            for vname, use_pa in variants.items():
-                fin = [finalize(a0, use_pa, pre_scores[vname] if mode != "pre" else None) for a0 in base]
-                if mode == "pre":
-                    pre_scores[vname] = {a["sym"]: a["score"] for a in fin}
-                cands = sorted([a for a in fin if abs(a["score"]) >= MIN_SCORE],
-                               key=lambda a: -abs(a["score"]))[:CANDIDATES]
-                best = {"CALL": None, "PUT": None}
-                for a in cands:
-                    side = "CALL" if a["score"] > 0 else "PUT"
-                    if (vname, a["sym"], side, day) in taken:
-                        continue
-                    df = data[a["sym"]][0]
-                    j0, j1 = df.index.searchsorted(entry_ts), df.index.searchsorted(exit_ts)
-                    bars = df.iloc[j0:j1]
-                    if len(bars) < 3:
-                        continue
-                    S_in = float(bars.iloc[0]["open"])
-                    opt = synth_option(a["sym"], S_in, side, a["hv"], entry_ts.to_pydatetime(), iv_mult, slip)
-                    if not opt:
-                        continue
-                    plan = trade_plan(opt, dict(a, spot=S_in))
-                    if not plan or plan["rr"] < MIN_RR:
-                        continue
-                    rank = abs(a["score"]) * 10 + min(plan["rr"], 3.0) * 5
-                    if best[side] is None or rank > best[side]["rank"]:
-                        best[side] = dict(a=a, opt=opt, plan=plan, bars=bars, rank=rank, side=side)
-
-                for side, b in best.items():
-                    if not b:
-                        continue
-                    a, opt, plan = b["a"], b["opt"], b["plan"]
-                    sim = simulate_trade(opt, plan, b["bars"], slip)
-                    if not sim:
-                        continue
-                    taken.add((vname, a["sym"], side, day))
-                    px_out, reason, t_out = sim
-                    pnl = (px_out - plan["entry"]) * CONTRACT_SIZE - 2 * commission
-                    pa_dir = 0 if a["pa_s"] == 0 else (1 if a["pa_s"] > 0 else -1)
-                    rows.append(dict(variant=vname, date=str(day), scan=label, symbol=a["sym"], side=side,
-                                     score=a["score"], strong=abs(a["score"]) >= STRONG_SCORE,
-                                     pa_points=a["pa_s"], pa_agrees=pa_dir == (1 if side == "CALL" else -1),
-                                     tags=" ".join(a["tags"]), strike=opt["strike"], expiry=opt["expiry"],
-                                     entry=plan["entry"], tp=plan["tp"], sl=plan["sl"], exit=round(px_out, 2),
-                                     reason=reason, exit_time=t_out.isoformat(), pnl=round(pnl, 2),
-                                     pnl_pct=round((px_out / plan["entry"] - 1) * 100, 1)))
+            prep.append(dict(day=day, mode=mode, label=label, entry_ts=entry_ts, exit_ts=exit_ts, base=base))
         if progress:
-            progress((di + 1) / len(test_days), f"Backtest day {di + 1}/{len(test_days)} ({day})")
+            progress((di + 1) / len(test_days), f"Reading signals, day {di + 1}/{len(test_days)} ({day})")
+    return prep
+
+
+def run_backtest(data, days=20, iv_mult=BT_IV_MULT, slip=BT_SLIPPAGE, commission=BT_COMMISSION, progress=None,
+                 prep=None, params=None, variants=None):
+    """One row per trade. params (all optional) override tp_frac, sl_frac, min_loss, max_loss, min_score, min_rr,
+    require_pa. variants = {name: use_price_action}; default compares with / without price action."""
+    p = dict(tp_frac=TP_FRAC, sl_frac=SL_MOVE_FRAC, min_loss=MIN_LOSS, max_loss=MAX_LOSS,
+             min_score=MIN_SCORE, min_rr=MIN_RR, require_pa=REQUIRE_PA, random_dir=None)
+    p.update(params or {})
+    variants = variants or {"Price action": True, "Indicators only": False}
+    if prep is None:
+        prep = prepare_backtest(data, days, progress)
+    rows, cur_day, pre_scores, taken = [], None, {}, set()
+    rnd = np.random.default_rng(p["random_dir"]) if p["random_dir"] is not None else None   # control run: coin-flip direction
+
+    for sc in prep:
+        day, mode, label, entry_ts, exit_ts = sc["day"], sc["mode"], sc["label"], sc["entry_ts"], sc["exit_ts"]
+        if day != cur_day:
+            cur_day, pre_scores, taken = day, {v: {} for v in variants}, set()
+        for vname, use_pa in variants.items():
+            fin = [finalize(a0, use_pa, pre_scores[vname] if mode != "pre" else None) for a0 in sc["base"]]
+            if mode == "pre":
+                pre_scores[vname] = {a["sym"]: a["score"] for a in fin}
+            cands = sorted([a for a in fin if abs(a["score"]) >= p["min_score"]
+                            and not (p["require_pa"] and use_pa and not pa_agrees(a))],
+                           key=lambda a: -abs(a["score"]))[:CANDIDATES]
+            best = {"CALL": None, "PUT": None}
+            for a in cands:
+                side = "CALL" if a["score"] > 0 else "PUT"
+                if rnd is not None:                                  # same stocks and exits, random direction
+                    flip = "CALL" if rnd.random() < 0.5 else "PUT"
+                    if flip != side:
+                        a = dict(a, sl_ref=None)
+                    side = flip
+                if (vname, a["sym"], side, day) in taken:
+                    continue
+                df = data[a["sym"]][0]
+                j0, j1 = df.index.searchsorted(entry_ts), df.index.searchsorted(exit_ts)
+                bars = df.iloc[j0:j1]
+                if len(bars) < 3:
+                    continue
+                S_in = float(bars.iloc[0]["open"])
+                opt = synth_option(a["sym"], S_in, side, a["hv"], entry_ts.to_pydatetime(), iv_mult, slip)
+                if not opt:
+                    continue
+                plan = trade_plan(opt, dict(a, spot=S_in), p["tp_frac"], p["sl_frac"], p["min_loss"], p["max_loss"])
+                if not plan or plan["rr"] < p["min_rr"]:
+                    continue
+                rank = abs(a["score"]) * 10 + min(plan["rr"], 3.0) * 5
+                if best[side] is None or rank > best[side]["rank"]:
+                    best[side] = dict(a=a, opt=opt, plan=plan, bars=bars, rank=rank, side=side)
+
+            for side, b in best.items():
+                if not b:
+                    continue
+                a, opt, plan = b["a"], b["opt"], b["plan"]
+                sim = simulate_trade(opt, plan, b["bars"], slip)
+                if not sim:
+                    continue
+                taken.add((vname, a["sym"], side, day))
+                px_out, reason, t_out = sim
+                pnl = (px_out - plan["entry"]) * CONTRACT_SIZE - 2 * commission
+                pa_dir = 0 if a["pa_s"] == 0 else (1 if a["pa_s"] > 0 else -1)
+                rows.append(dict(variant=vname, date=str(day), scan=label, symbol=a["sym"], side=side,
+                                 score=a["score"], strong=abs(a["score"]) >= STRONG_SCORE,
+                                 pa_points=a["pa_s"], pa_agrees=pa_dir == (1 if side == "CALL" else -1),
+                                 tags=" ".join(a["tags"]), strike=opt["strike"], expiry=opt["expiry"],
+                                 entry=plan["entry"], tp=plan["tp"], sl=plan["sl"], exit=round(px_out, 2),
+                                 reason=reason, exit_time=t_out.isoformat(), pnl=round(pnl, 2),
+                                 pnl_pct=round((px_out / plan["entry"] - 1) * 100, 1)))
     return pd.DataFrame(rows)
+
+
+# ----- sweep: try many exit / filter settings, tune on the EARLY days, check them on the LATER days -----
+SWEEP_GRID = dict(tp_frac=[0.4, 0.7, 1.0],            # target distance (x expected move)
+                  sl_frac=[0.5, 1.0, 1.5],            # stop distance (x expected move)
+                  max_loss=[0.30, 0.50],              # option stop never wider than this share of the premium
+                  min_score=[3, 5],                   # signal strength needed
+                  mode=["Indicators only", "Price action", "PA must agree"])
+
+
+def run_sweep(data, prep, iv_mult=BT_IV_MULT, slip=BT_SLIPPAGE, commission=BT_COMMISSION, train_frac=0.6,
+              progress=None):
+    """Chronological split: the first `train_frac` of the days is for choosing, the rest only for checking.
+    A setting that wins on 'train' but loses on 'test' was just fitted to noise."""
+    days = sorted({str(s["day"]) for s in prep})
+    if len(days) < 6:
+        return pd.DataFrame()
+    split = days[max(1, int(len(days) * train_frac))]            # first test day
+    combos = list(itertools.product(SWEEP_GRID["tp_frac"], SWEEP_GRID["sl_frac"], SWEEP_GRID["max_loss"],
+                                    SWEEP_GRID["min_score"], SWEEP_GRID["mode"]))
+    out = []
+    for n, (tp, sl, ml, ms, mode) in enumerate(combos, 1):
+        params = dict(tp_frac=tp, sl_frac=sl, max_loss=ml, min_score=ms, min_rr=0.3,
+                      require_pa=(mode == "PA must agree"))
+        tr = run_backtest(data, iv_mult=iv_mult, slip=slip, commission=commission, prep=prep, params=params,
+                          variants={"v": mode != "Indicators only"})
+        if not tr.empty:
+            row = dict(mode=mode, tp_frac=tp, sl_frac=sl, max_loss=ml, min_score=ms)
+            # control: identical stocks / exits but random call-or-put (2 seeds) - the signals must beat this
+            ctrl = pd.concat([run_backtest(data, iv_mult=iv_mult, slip=slip, commission=commission, prep=prep,
+                                           params=dict(params, random_dir=sd), variants={"v": mode != "Indicators only"})
+                              for sd in (1, 2)])
+            ct = ctrl[ctrl["date"] >= split] if not ctrl.empty else ctrl
+            row["random_test_pnl$"] = round(ct["pnl"].sum() / 2, 0) if not ct.empty else 0.0
+            row["random_test_win%"] = round((ct["pnl"] > 0).mean() * 100, 1) if not ct.empty else 0.0
+            for name, part in (("train", tr[tr["date"] < split]), ("test", tr[tr["date"] >= split])):
+                s = summarize(part)
+                row[f"{name}_trades"] = s.get("Trades", 0)
+                row[f"{name}_win%"] = s.get("Win rate %", 0.0)
+                row[f"{name}_pf"] = s.get("Profit factor", 0.0)
+                row[f"{name}_pnl$"] = s.get("Total P&L $", 0.0)
+            out.append(row)
+        if progress:
+            progress(n / len(combos), f"Sweep {n}/{len(combos)}")
+    df = pd.DataFrame(out)
+    if df.empty:
+        return df
+    # strict rule (calibrated on random, zero-edge data where it passed 0-4 of 108 settings, vs ~40 when a real
+    # edge exists): profitable with PF >= 1.5 on BOTH halves, enough trades, and the test half beats the same exits
+    # with a random call/put by a wide margin (otherwise the exits - not the signals - made the money)
+    df["beats_random"] = df["test_pnl$"] > df["random_test_pnl$"] + 1.0 * df["test_pnl$"].abs()
+    df["holds_up"] = ((df["train_pnl$"] > 0) & (df["test_pnl$"] > 0) & (df["train_pf"] >= 1.5) & (df["test_pf"] >= 1.5)
+                      & (df["train_trades"] >= 30) & (df["test_trades"] >= 30) & df["beats_random"])
+    df["split_date"] = split
+    return df.sort_values("train_pf", ascending=False).reset_index(drop=True)
 
 
 def summarize(tr):
@@ -1212,25 +1298,100 @@ def render_backtest_tab():
     comm = c4.number_input("Commission $/contract/side", 0.0, 5.0, BT_COMMISSION, 0.05)
     nsym = st.slider("Stocks", 10, len(SYMBOLS), len(SYMBOLS), 5)
 
-    if st.button("Run backtest", type="primary"):
+    def get_prep(cb):
+        """Download + read signals once; kept for the sweep so it does not repeat the slow part."""
+        key = (days, nsym)
+        if st.session_state.get("bt_key") != key:
+            data = fetch_history(SYMBOLS[:nsym], cb)
+            if not data:
+                return None, None
+            st.session_state.update(bt_data=data, bt_prep=prepare_backtest(data, days, cb), bt_key=key)
+        return st.session_state["bt_data"], st.session_state["bt_prep"]
+
+    b1, b2 = st.columns(2)
+    if b1.button("Run backtest", type="primary"):
         bar = st.progress(0.0, text="Starting...")
         cb = lambda f, t: bar.progress(min(max(f, 0.0), 1.0), text=t)
-        data = fetch_history(SYMBOLS[:nsym], cb)
+        data, prep = get_prep(cb)
         if not data:
             bar.empty()
             st.error("Could not download history from yfinance.")
         else:
-            tr = run_backtest(data, days, iv_mult, slip, comm, cb)
+            tr = run_backtest(data, days, iv_mult, slip, comm, prep=prep)
             bar.empty()
             if not tr.empty:
                 tr.to_csv(BT_FILE, index=False)
             st.session_state["bt"] = tr
+    if b2.button("Sweep settings (train on early days, test on later days)"):
+        bar = st.progress(0.0, text="Starting...")
+        cb = lambda f, t: bar.progress(min(max(f, 0.0), 1.0), text=t)
+        data, prep = get_prep(cb)
+        if not data:
+            bar.empty()
+            st.error("Could not download history from yfinance.")
+        else:
+            sw = run_sweep(data, prep, iv_mult, slip, comm, progress=cb)
+            bar.empty()
+            if not sw.empty:
+                sw.to_csv(SWEEP_FILE, index=False)
+            st.session_state["sweep"] = sw
     tr = st.session_state.get("bt")
     if tr is None and os.path.exists(BT_FILE):
         tr = pd.read_csv(BT_FILE)
         st.caption(f"Showing the last saved backtest ({BT_FILE}).")
     if tr is not None:
         show_backtest(tr)
+    sw = st.session_state.get("sweep")
+    if sw is None and os.path.exists(SWEEP_FILE):
+        sw = pd.read_csv(SWEEP_FILE)
+    if sw is not None:
+        show_sweep(sw)
+
+
+def show_sweep(sw):
+    st.subheader("Sweep results")
+    if sw.empty:
+        st.info("Not enough days or trades for a sweep (needs 6+ trading days).")
+        return
+    st.caption(f"Settings were ranked on the days BEFORE {sw['split_date'].iloc[0]} (train) and then checked on the "
+               "days from then on (test) - the test columns are the honest ones. 'holds_up' = profit factor 1.5+ in both "
+               "halves, 30+ trades each, and far better than the same exits with a random call/put. On random data this "
+               "rule passes 0-4 of 108 settings, so only a clearly larger count means something. A high train score that fails on test is overfitting; do not use it.")
+    good = sw[sw["holds_up"]]
+    hi = good[good["test_win%"] >= 70]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Settings tried", len(sw))
+    c2.metric("Hold up on both halves", len(good))
+    c3.metric("...and 70%+ win rate on test", len(hi))
+    if good.empty:
+        st.warning("No setting was profitable on both the early and the later days. That is a real result: with "
+                   "this data, the signals show no edge to tune. Do not trade these scans on that basis.")
+    st.markdown("**Settings that hold up (best test profit factor first)**")
+    st.dataframe(good.sort_values("test_pf", ascending=False) if not good.empty else good)
+    with st.expander("All settings tried"):
+        st.dataframe(sw)
+    st.caption("To use a row, copy its values into TP_FRAC, SL_MOVE_FRAC, MAX_LOSS, MIN_SCORE (and REQUIRE_PA = True "
+               "for 'PA must agree'; MIN_RR to 0.3 as the sweep used) at the top of the file. Re-test on fresh days "
+               "later - 60 days of data is a small sample.")
+
+
+def cli_sweep(days):
+    print(f"Downloading history for {len(SYMBOLS)} stocks ...")
+    data = fetch_history(SYMBOLS, lambda f, t: None)
+    print(f"{len(data)} stocks. Reading signals for {days} days (slow, once) ...")
+    prep = prepare_backtest(data, days)
+    sw = run_sweep(data, prep)
+    if sw.empty:
+        print("Not enough data for a sweep.")
+        return
+    sw.to_csv(SWEEP_FILE, index=False)
+    pd.set_option("display.width", 250)
+    pd.set_option("display.max_columns", 30)
+    good = sw[sw["holds_up"]]
+    print(f"{len(sw)} settings tried, {len(good)} profitable on BOTH early (train) and later (test) days, "
+          f"{len(good[good['test_win%'] >= 70])} of those with 70%+ win rate on test.")
+    print((good if not good.empty else sw.head(10)).sort_values("test_pf", ascending=False).head(15).to_string())
+    print(f"\nAll results saved to {SWEEP_FILE}")
 
 
 def cli_backtest(days):
@@ -1346,7 +1507,10 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--backtest" in sys.argv:
+    if "--sweep" in sys.argv:
+        i = sys.argv.index("--sweep")
+        cli_sweep(int(sys.argv[i + 1]) if len(sys.argv) > i + 1 and sys.argv[i + 1].isdigit() else 40)
+    elif "--backtest" in sys.argv:
         i = sys.argv.index("--backtest")
         cli_backtest(int(sys.argv[i + 1]) if len(sys.argv) > i + 1 and sys.argv[i + 1].isdigit() else 20)
     else:
