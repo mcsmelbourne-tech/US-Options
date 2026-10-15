@@ -8,6 +8,10 @@ US Top-100 Call/Put Scanner - scheduled scans every US trading day (yfinance + G
 Top of the page: US INDICES box (S&P 500, Dow, Nasdaq, Nasdaq 100, Russell 2000, ... + SPY, QQQ, DIA, IWM)
                  with price and daily change, and the TOP 10 US SHARES below it (price + daily change).
 
+COMMODITIES box (below the top-10 shares): Coffee, Gold, Silver, Natural gas, Spot crude (WTI), Copper, Nickel -
+                 price, daily change and a BUY / SELL / WAIT call for the next 1 hour with entry / TP / SL,
+                 recomputed every hour while that market is open (and sent to Telegram).
+
 Per stock: EMA 9 / EMA 15, RSI, MACD, volume (relative to normal), ATR, VWAP, gap
            + PRICE ACTION: swing structure (HH/HL, LH/LL), break of structure (BOS), candle patterns
              (engulfing, hammer, shooting star, strong bar), previous-day high/low breaks, and a
@@ -153,6 +157,22 @@ INDICES = [
 TOP10 = [("Apple", "AAPL"), ("Microsoft", "MSFT"), ("Nvidia", "NVDA"), ("Alphabet", "GOOGL"), ("Amazon", "AMZN"),
          ("Meta", "META"), ("Broadcom", "AVGO"), ("Tesla", "TSLA"), ("Berkshire B", "BRK-B"), ("Eli Lilly", "LLY")]
 MARKET_REFRESH_SEC = 30
+
+# ----- commodities (Yahoo futures symbols; first working symbol in each list is used) -----
+COMMODITIES = [
+    ("Coffee", ["KC=F"]),
+    ("Gold", ["GC=F"]),
+    ("Silver", ["SI=F"]),
+    ("Natural gas", ["NG=F"]),
+    ("Spot crude (WTI)", ["CL=F"]),
+    ("Copper", ["HG=F"]),
+    ("Nickel", ["NI=F"]),          # LME nickel has no reliable free Yahoo feed - shows "no data" if Yahoo has none
+]
+COMM_FILE = "commodity_state.json"
+COMM_TELEGRAM = True                         # send each hourly commodity update to Telegram (set False to mute)
+COMM_MIN_SCORE = 3                           # minimum |score| for a BUY / SELL (otherwise WAIT)
+COMM_MIN_RR = 1.2                            # below this reward:risk the call becomes WAIT
+COMM_OPEN_MAX_AGE_MIN = 30                   # market counts as open when the newest 5-min bar is this fresh
 
 # ----------------------------- CONFIG / STATE / TELEGRAM -----------------------------
 
@@ -767,6 +787,180 @@ def scan_once(mode, pre_prev=None, label=None):
     log_picks(res)
     return res
 
+# ----------------------------- COMMODITIES (next-1-hour BUY / SELL call) -----------------------------
+# Same method as the stock scans, on 5-minute futures bars: EMA 9/15, price vs EMA 50, session VWAP (since 18:00 ET),
+# RSI, MACD, 1-hour momentum, daily trend, swing structure (HH/HL, LH/LL) and break of structure.
+# Open / closed is decided from the data itself: if the newest 5-minute bar is fresh the market is open (so
+# different exchange hours and holidays are handled). Hours are ET internally; Sydney time is shown on screen.
+
+def _clean_24h(df):
+    if df is None or df.empty:
+        return None
+    df = _to_et(df).rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    return df if len(df) else None
+
+
+def comm_signal(df, dd, name, sym):
+    """BUY / SELL / WAIT for the next hour from 5-minute futures bars (df) and daily bars (dd)."""
+    if df is None or dd is None or len(df) < 80 or len(dd) < 25:
+        return None
+    close = df["close"]
+    spot = float(close.iloc[-1])
+    ts = df.index[-1]
+    last_end = ts + pd.Timedelta(minutes=5)
+    e9, e15, e50 = ema(close, 9), ema(close, 15), ema(close, 50)
+    macd = ema(close, 12) - ema(close, 26)
+    hist = macd - ema(macd, 9)
+    r = rsi(close)
+    a5 = max(float(atr(df).iloc[-1]), 1e-9)
+
+    start = ts.normalize() + pd.Timedelta(hours=18)                   # futures session starts 18:00 ET
+    if start > ts:
+        start -= pd.Timedelta(days=1)
+    sess = df[df.index >= start]
+    if len(sess) < 3:
+        sess = df.tail(72)
+    typ = (sess["high"] + sess["low"] + sess["close"]) / 3
+    vs = float(sess["volume"].sum())
+    vwap = float((typ * sess["volume"]).sum() / vs) if vs > 0 else float(typ.mean())
+
+    s, tags = 0, []
+
+    def add(v, tag):
+        nonlocal s
+        s += v
+        if v:
+            tags.append(("+" if v > 0 else "-") + tag)
+
+    rsi_last = float(r.iloc[-1])
+    h_last, h_prev = float(hist.iloc[-1]), float(hist.iloc[-2])
+    add(1 if e9.iloc[-1] > e15.iloc[-1] else -1, "EMA9/15")
+    add(1 if spot > e50.iloc[-1] else -1, "EMA50")
+    add(1 if spot > vwap else -1, "VWAP")
+    add(1 if rsi_last > 55 else (-1 if rsi_last < 45 else 0), "RSI")
+    add(1 if (h_last > 0 and h_last > h_prev) else (-1 if (h_last < 0 and h_last < h_prev) else 0), "MACD")
+    mom = (spot - float(close.iloc[-13])) / a5                         # last hour
+    add(1 if mom > 1.5 else (-1 if mom < -1.5 else 0), "Mom1h")
+    dclose = dd["close"]
+    add(1 if float(dclose.iloc[-1]) > float(ema(dclose, 20).iloc[-1]) else -1, "DayTrend")
+
+    sh, sl = _swings(df.tail(150))
+    if len(sh) >= 2 and len(sl) >= 2:
+        if sh[-1] > sh[-2] and sl[-1] > sl[-2]:
+            add(1, "HH/HL")
+        elif sh[-1] < sh[-2] and sl[-1] < sl[-2]:
+            add(-1, "LH/LL")
+    if sh and spot > sh[-1]:
+        add(1, "BOS-up")
+    elif sl and spot < sl[-1]:
+        add(-1, "BOS-down")
+    if rsi_last > 75:
+        add(-1, "overbought")
+    elif rsi_last < 25:
+        add(1, "oversold")
+
+    sig = "WAIT"
+    if abs(s) >= COMM_MIN_SCORE:
+        sig = "BUY" if s > 0 else "SELL"
+    sign = 1 if s > 0 else -1
+    hr_move = a5 * math.sqrt(12) * 0.8                                  # expected 1-hour move (12 five-minute bars)
+    tp = spot + sign * hr_move
+    sl_dist = 0.6 * hr_move
+    ref = (next((x for x in reversed(sl) if x < spot - 0.1 * a5), None) if s > 0
+           else next((x for x in reversed(sh) if x > spot + 0.1 * a5), None))
+    if ref is not None:                                                 # stop just beyond the last swing
+        dist = abs(spot - ref) + 0.1 * a5
+        if 0.3 * hr_move <= dist <= hr_move:
+            sl_dist = dist
+    sl_px = spot - sign * sl_dist
+    rr = hr_move / max(sl_dist, 1e-9)
+    if sig != "WAIT" and rr < COMM_MIN_RR:
+        sig = "WAIT"
+        tags.append("poor R:R")
+
+    age_min = (dt.datetime.now(ET) - last_end.to_pydatetime()).total_seconds() / 60
+    return dict(name=name, sym=sym, signal=sig, score=int(s), strength="Strong" if abs(s) >= 6 else "Moderate",
+                spot=spot, entry=spot, tp=float(tp), sl=float(sl_px), rr=float(rr), hr_move=float(hr_move),
+                rsi=rsi_last, tags=tags, time=last_end.isoformat(), open=bool(age_min <= COMM_OPEN_MAX_AGE_MIN))
+
+
+def comm_fetch(name, cands):
+    for sym in cands:
+        try:
+            df = _clean_24h(yf.Ticker(sym).history(period="5d", interval="5m"))
+            sig = comm_signal(df, fetch_daily(sym, period="6mo"), name, sym)
+            if sig:
+                return sig
+        except Exception:
+            continue
+    return None
+
+
+def comm_slot(now):
+    return now.strftime("%Y-%m-%d %H")                                  # one update per ET clock hour
+
+
+def comm_maybe_open(now):
+    """Cheap pre-check (ET) so weekends do not download anything. The data freshness check decides the rest."""
+    wd, t = now.weekday(), now.time()
+    return not (wd == 5 or (wd == 6 and t < dt.time(17, 0)) or (wd == 4 and t >= dt.time(18, 0)))
+
+
+def comm_due(now, state):
+    """True when this clock hour has not been done yet (waits until minute :01 so the last 5-min bar has closed)."""
+    return state.get("slot") != comm_slot(now) and (now.minute >= 1 or not state.get("slot"))
+
+
+def _pxf(v):
+    return f"{v:,.2f}" if abs(v) >= 10 else f"{v:,.3f}"
+
+
+def comm_telegram_text(now, sigs):
+    lines = [f"🛢️ COMMODITIES · {now.strftime('%H:%M')} ET · next 1 hour"]
+    for name, _ in COMMODITIES:
+        s = sigs.get(name)
+        if not s or not s.get("open") or s.get("stale"):
+            continue
+        icon = {"BUY": "🟢", "SELL": "🔴"}.get(s["signal"], "⚪")
+        if s["signal"] in ("BUY", "SELL"):
+            lines.append(f"{icon} {name} {s['signal']} {_pxf(s['entry'])} -> TP {_pxf(s['tp'])} / SL {_pxf(s['sl'])} "
+                         f"(R:R {s['rr']:.1f}, score {s['score']:+d})")
+        else:
+            lines.append(f"{icon} {name} WAIT {_pxf(s['spot'])} (score {s['score']:+d})")
+    return "\n".join(lines) if len(lines) > 1 else None
+
+
+def run_commodities(cfg, force=False):
+    """Hourly update. Returns True when it ran. Markets that are closed keep their last signal, marked stale."""
+    now = dt.datetime.now(ET)
+    state = _load_json(COMM_FILE)
+    if not (force or comm_due(now, state)):
+        return False
+    old = state.get("signals", {})
+    if comm_maybe_open(now):
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            got = list(ex.map(lambda item: comm_fetch(*item), COMMODITIES))
+    else:
+        got = [None] * len(COMMODITIES)
+    sigs = {}
+    for (name, cands), sig in zip(COMMODITIES, got):
+        if sig and sig["open"]:
+            sigs[name] = sig
+        elif old.get(name):
+            sigs[name] = dict(old[name], stale=True, open=False)       # keep the last live call, flagged
+        elif sig:
+            sigs[name] = dict(sig, signal="CLOSED", open=False)
+        else:
+            sigs[name] = dict(name=name, sym=cands[0], signal="N/A", open=False)
+    state = dict(slot=comm_slot(now), time=now.isoformat(timespec="seconds"), signals=sigs)
+    if COMM_TELEGRAM:
+        text = comm_telegram_text(now, sigs)
+        if text:
+            state["telegram"] = send_telegram(cfg, text)
+    _save_json(COMM_FILE, state)
+    return True
+
 # ----------------------------- SCHEDULE -----------------------------
 
 def _done(state, key, today):
@@ -1289,7 +1483,7 @@ def _metric_grid(items, quotes, ncol=5):
 
 
 def render_market(box):
-    syms = tuple(s for _, s in INDICES) + tuple(s for _, s in TOP10)
+    syms = tuple(s for _, s in INDICES) + tuple(s for _, s in TOP10) + tuple(c[1][0] for c in COMMODITIES)
     q = market_quotes(syms)
     with box.container():
         with st.container(border=True):
@@ -1298,6 +1492,59 @@ def render_market(box):
         with st.container(border=True):
             st.markdown("**Top 10 US shares** - price and change on the day")
             _metric_grid([(f"{n} ({s})", s) for n, s in TOP10], q)
+        render_commodities(q)
+
+
+def render_commodities(quotes):
+    """Commodities box: live price + day change (refreshes with the market panel) and the hourly BUY / SELL call."""
+    state = _load_json(COMM_FILE)
+    sigs = state.get("signals", {})
+    with st.container(border=True):
+        st.markdown("**Commodities - buy / sell call for the next 1 hour**")
+        if state.get("time"):
+            when = dt.datetime.fromisoformat(state["time"])
+            nxt = when.replace(minute=1, second=0, microsecond=0) + dt.timedelta(hours=1)
+            st.caption(f"Calls updated {when.strftime('%a %H:%M')} ET ({fmt_local(when)} your time); recomputed every hour "
+                       f"while each market is open - next about {nxt.strftime('%H:%M')} ET. Prices below refresh every "
+                       f"{MARKET_REFRESH_SEC}s. Educational estimate, not advice.")
+        else:
+            st.caption("First hourly update is being prepared...")
+        for i in range(0, len(COMMODITIES), 4):
+            cols = st.columns(4)
+            for c, (name, cands) in zip(cols, COMMODITIES[i:i + 4]):
+                s = sigs.get(name)
+                d = quotes.get(cands[0])
+                with c:
+                    with st.container(border=True):
+                        st.markdown(f"**{name}**")
+                        if d:
+                            st.metric(cands[0].replace("=F", " futures"), _pxf(d["price"]),
+                                      f"{d['chg']:+,.3f} ({d['pct']:+.2f}%)" if abs(d["price"]) < 10
+                                      else f"{d['chg']:+,.2f} ({d['pct']:+.2f}%)")
+                        else:
+                            st.metric(cands[0], "n/a")
+                        sig = (s or {}).get("signal", "N/A")
+                        if sig == "N/A":
+                            st.warning("No data feed for this symbol")
+                        elif sig == "CLOSED":
+                            st.warning("Market closed")
+                        else:
+                            txt = f"{sig} next 1h - {s['strength']} (score {s['score']:+d})"
+                            if sig == "BUY":
+                                st.success("🟢 " + txt)
+                            elif sig == "SELL":
+                                st.error("🔴 " + txt)
+                            else:
+                                st.info("⚪ WAIT - no clear edge")
+                            if sig in ("BUY", "SELL"):
+                                st.caption(f"Entry {_pxf(s['entry'])} | TP {_pxf(s['tp'])} | SL {_pxf(s['sl'])} | "
+                                           f"R:R {s['rr']:.1f}")
+                            st.caption(f"1h range est {_pxf(s['spot'] - s['hr_move'])} - {_pxf(s['spot'] + s['hr_move'])} | "
+                                       f"RSI {s['rsi']:.0f}")
+                            st.caption(" ".join(s["tags"]))
+                            if s.get("stale"):
+                                t0 = dt.datetime.fromisoformat(s["time"])
+                                st.caption(f"Market closed - last live call {t0.strftime('%a %H:%M')} ET")
 
 
 # ----- Moomoo-style order ticket (dark panel, inline styles only) -----
@@ -1686,6 +1933,8 @@ def main():
     # indices box + top 10 shares first, so they show while a scan is running
     mkt_box = st.empty()
     render_market(mkt_box)
+    if run_commodities(cfg):                     # hourly commodity calls (own schedule, own file)
+        render_market(mkt_box)
 
     if auto:
         run_scheduled(cfg)
@@ -1747,6 +1996,10 @@ def main():
             now = dt.datetime.now(ET)
             if due_scan(now, load_state()):
                 st.rerun()
+            if comm_due(now, _load_json(COMM_FILE)):                  # new clock hour -> new commodity calls
+                run_commodities(cfg)
+                render_market(mkt_box)
+                last_mkt = time.time()
             if time.time() - last_mkt >= MARKET_REFRESH_SEC:          # keep the index / top-10 prices fresh
                 render_market(mkt_box)
                 last_mkt = time.time()
