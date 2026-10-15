@@ -100,6 +100,8 @@ def ct_find(name):
 
 def ctrader_bars(name):
     """(5-minute bars UTC, daily bars, cTrader symbol) or None when the feed is not running."""
+    if not COMM_USE_CTRADER:
+        return None
     sym = ct_find(name)
     if not sym:
         return None
@@ -246,7 +248,8 @@ COMMODITIES = [
     ("Nickel", ["NI=F"]),          # LME nickel has no reliable free Yahoo feed - shows "no data" if Yahoo has none
 ]
 COMM_FILE = "commodity_state.json"
-COMM_YAHOO_FALLBACK = False                  # False = prices and calls come ONLY from the cTrader feed
+COMM_USE_CTRADER = False                     # True = use the cTrader price files (PriceFeedExporter cBot) when they are fresh
+COMM_YAHOO_FALLBACK = True                   # True = Yahoo Finance prices and calls (used whenever cTrader is off / not running)
 COMM_TELEGRAM = True                         # send each hourly commodity update to Telegram (set False to mute)
 COMM_MIN_SCORE = 3                           # minimum |score| for a BUY / SELL (otherwise WAIT)
 COMM_MIN_RR = 1.2                            # below this reward:risk the call becomes WAIT
@@ -1106,6 +1109,7 @@ def run_scheduled(cfg):
         state[key] = res
         save_state(state)
         res["telegram"] = send_telegram(cfg, telegram_text(res))
+        send_tickets(cfg, res)
         state[key] = res
         save_state(state)
     except Exception as e:
@@ -1690,6 +1694,169 @@ def _quote_bar(o, entry):
             f'{bar}{labels}</div>')
 
 
+# ----- Moomoo-style order ticket as a PNG image (shown on the page and sent to Telegram) -----
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    HAVE_PIL = True
+except Exception:
+    HAVE_PIL = False
+
+
+def _tfont(size, bold=False):
+    names = ["arialbd.ttf", "segoeuib.ttf", "DejaVuSans-Bold.ttf"] if bold else ["arial.ttf", "segoeui.ttf", "DejaVuSans.ttf"]
+    for n in names:
+        try:
+            return ImageFont.truetype(n, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def ticket_png(item, title=None):
+    """PNG that looks like the Moomoo order ticket, filled with the exact values to enter. None if Pillow is missing."""
+    if not HAVE_PIL:
+        return None
+    try:
+        import io
+        o, p, a = item["opt"], item["plan"], item["a"]
+        S, W, pad = 2, 440, 22                                   # drawn at 2x for a sharp image
+        img = Image.new("RGB", (W * S, 1300 * S), _BG)
+        d = ImageDraw.Draw(img)
+        f_s, f_m, f_b, f_t = _tfont(14 * S), _tfont(17 * S), _tfont(17 * S, True), _tfont(22 * S, True)
+        y = pad
+
+        def txt(x, yy, t, f, fill=_TXT, anchor="l"):             # (x, yy) = left / middle / right edge, vertical centre
+            try:
+                d.text((x * S, yy * S), t, font=f, fill=fill, anchor=anchor + "m")
+            except Exception:
+                w = d.textlength(t, font=f) / S
+                d.text(((x - (w if anchor == "r" else w / 2 if anchor == "m" else 0)) * S, (yy - 8) * S), t, font=f, fill=fill)
+
+        def box(x0, y0, x1, y1, fill=_FIELD):
+            d.rounded_rectangle((x0 * S, y0 * S, x1 * S, y1 * S), radius=5 * S, fill=fill, outline=_LINE, width=S)
+
+        def label(t):
+            nonlocal y
+            txt(pad, y + 9, t, f_s, _MUT)
+            y += 24
+
+        def field(t, fill=_TXT, bg=_FIELD, right=None):
+            nonlocal y
+            box(pad, y, W - pad, y + 40, bg)
+            txt(pad + 12, y + 20, t, f_m, fill)
+            if right:
+                txt(W - pad - 12, y + 20, right, f_m, _MUT, "r")
+            y += 40 + 10
+
+        def stepper(v, color=_TXT):
+            nonlocal y
+            box(pad, y, W - pad, y + 40)
+            txt(pad + 18, y + 20, "-", f_b, _MUT, "m")
+            txt(W / 2, y + 20, v, f_b, color, "m")
+            txt(W - pad - 18, y + 20, "+", f_b, _MUT, "m")
+            y += 40 + 6
+
+        def note(t, color):
+            nonlocal y
+            txt(pad, y + 8, t, f_s, color)
+            y += 26
+
+        def check(x, yy, t):
+            d.rounded_rectangle((x * S, (yy - 8) * S, (x + 16) * S, (yy + 8) * S), radius=3 * S, fill=_BLU)
+            d.line([((x + 4) * S, yy * S), ((x + 7) * S, (yy + 4) * S), ((x + 12) * S, (yy - 4) * S)], fill="#ffffff", width=2 * S)
+            txt(x + 24, yy, t, f_m)
+
+        code = opt_code(o)
+        gain_pct = (p["tp"] / p["entry"] - 1) * 100
+        loss_pct = (1 - p["sl"] / p["entry"]) * 100
+
+        txt(pad, y + 14, "Trade", f_t)
+        txt(W - pad, y + 14, title or f"{o['symbol']} {o['side']}", f_s, _BLU, "r")
+        y += 44
+        label("Contract")
+        box(pad, y, pad + 270, y + 40)
+        txt(pad + 12, y + 20, code, f_m)
+        box(pad + 282, y, W - pad, y + 40, "#1d3a2b")
+        txt(pad + 294, y + 20, "Buy", f_m, _GRN)
+        y += 50
+        label("Session")
+        field("RTH only", _MUT)
+        label("Order Type")
+        field("Limit")
+        label("Price")
+        stepper(f"{p['entry']:.2f}")
+        live = bool(o["market_open"]) and o["ask"] > 0
+        mid = (o["bid"] + o["ask"]) / 2 if live else o["last"]
+        txt(pad, y + 8, "Bid", f_s, _MUT)
+        txt(W / 2, y + 8, "Mid", f_s, _MUT, "m")
+        txt(W - pad, y + 8, "Ask", f_s, _MUT, "r")
+        y += 22
+        fmt = (lambda v: f"{v:.2f}") if live else (lambda v: "--")
+        txt(pad, y + 8, fmt(o["bid"]), f_s)
+        txt(W / 2, y + 8, fmt(mid) if live else (f"{o['last']:.2f}" if o["last"] else "--"), f_s, _TXT, "m")
+        txt(W - pad, y + 8, fmt(o["ask"]), f_s, _TXT, "r")
+        y += 30
+        label("Contracts x100 shares")
+        stepper("1")
+        label("TIF")
+        field("Day")
+        check(pad, y + 12, "Take Profit")
+        check(pad + 190, y + 12, "Stop Loss")
+        y += 36
+        label("TP Price")
+        stepper(f"{p['tp']:.2f}")
+        note(f"+${p['profit_1lot']:,.0f} per lot (+{gain_pct:.0f}%)", _GRN)
+        label("SL Price")
+        stepper(f"{p['sl']:.2f}")
+        note(f"-${p['loss_1lot']:,.0f} per lot (-{loss_pct:.0f}%)", _RED)
+        label("TIF")
+        field("GTC")
+        txt(pad, y + 12, "Amount", f_m, _MUT)
+        txt(W - pad, y + 12, f"{p['cost_1lot']:,.2f} USD (Debit)", f_b, _TXT, "r")
+        y += 36
+        d.rounded_rectangle((pad * S, y * S, (W - pad) * S, (y + 44) * S), radius=5 * S, fill=_ORG)
+        txt(W / 2, y + 22, "Enter these values in Moomoo", f_b, "#ffffff", "m")
+        y += 58
+        txt(pad, y + 8, f"{o['symbol']} {a['spot']:.2f} | strike {o['strike']:g} {o['side']} | exp {o['expiry']} ({o['dte']}d)", f_s, _MUT)
+        y += 22
+        txt(pad, y + 8, f"Delta {o['delta']:.2f} | IV {o['iv'] * 100:.0f}% | R:R {p['rr']} | day est {a['pred_close']:.2f}", f_s, _MUT)
+        y += 30
+        img = img.crop((0, 0, W * S, y * S))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def send_telegram_photo(cfg, png, caption=""):
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or cfg.get("telegram_bot_token")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID") or cfg.get("telegram_chat_id")
+    if not token or not chat_id or not png:
+        return False
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendPhoto",
+                          data={"chat_id": chat_id, "caption": caption[:1000]},
+                          files={"photo": ("ticket.png", png, "image/png")}, timeout=30)
+        return r.ok
+    except Exception:
+        return False
+
+
+def send_tickets(cfg, res):
+    """After the text alert: one Moomoo-style order-ticket picture per side (CALL / PUT) with the exact values."""
+    for side in ("CALL", "PUT"):
+        it = res.get(side)
+        if not it:
+            continue
+        o = it["opt"]
+        star = " (TOP PICK)" if res.get("top") == side else ""
+        send_telegram_photo(cfg, ticket_png(it), f"{side} {o['symbol']} {opt_code(o)}{star} - enter in Moomoo")
+
+
 def order_ticket_html(item):
     """Looks like the Moomoo order ticket, filled with the scanner's values."""
     o, p = item["opt"], item["plan"]
@@ -1835,13 +2002,19 @@ def draw_box(item, side, is_top, ns=""):
                    f"{' · BLOCKED (level too close)' if 'PA:blocked' in a['tags'] else ''}")
         if not o["market_open"]:
             st.caption("Option quotes not live - last price used. Confirm bid/ask before entry.")
-        with st.expander("Order ticket and option chart"):
+        with st.expander("Order ticket - enter these values in Moomoo", expanded=True):
+            png = ticket_png(item)
+            if png:
+                st.image(png, width=380)
+            else:
+                st.markdown(order_ticket_html(item), unsafe_allow_html=True)
+                st.caption("Install Pillow (pip install pillow) to get this as a picture you can save or screenshot.")
+        with st.expander("Option chart"):
             link = tv_option_url(o)
             try:
                 st.link_button(f"📈 {o['symbol']} {opt_code(o)} on TradingView (OPRA)", link)
             except AttributeError:
                 st.markdown(f"[📈 {o['symbol']} {opt_code(o)} on TradingView (OPRA)]({link})")
-            st.markdown(order_ticket_html(item), unsafe_allow_html=True)
             if st.toggle("Load option chart", value=False, key=f"oc_{ns}_{side}_{o['contract']}"):
                 option_chart(item)
 
@@ -2191,6 +2364,7 @@ def main():
                 manual[mode] = scan_once(mode, pre_scores_today(load_state()) if mode != "pre" else None, label)
                 if tg_manual:
                     manual[mode]["telegram"] = send_telegram(cfg, telegram_text(manual[mode]))
+                    send_tickets(cfg, manual[mode])
 
     state = load_state()
     now = dt.datetime.now(ET)
