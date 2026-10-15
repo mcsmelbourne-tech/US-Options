@@ -1965,7 +1965,9 @@ def draw_box_full(item, side, is_top, ns=""):
             st.caption("Exit: at TP or SL, early if a 5-min bar closes back through EMA15 against you, "
                        "otherwise by 15:45 ET.")
         with right:
-            st.markdown(order_ticket_html(item), unsafe_allow_html=True)
+            _png = ticket_png(item)
+            if _png:
+                st.image(_png, width=380)
         if st.toggle(f"Show {o['symbol']} {opt_code(o)} option chart", value=True, key=f"oc_{ns}_{side}_{o['contract']}"):
             option_chart(item)
 
@@ -2007,8 +2009,7 @@ def draw_box(item, side, is_top, ns=""):
             if png:
                 st.image(png, width=380)
             else:
-                st.markdown(order_ticket_html(item), unsafe_allow_html=True)
-                st.caption("Install Pillow (pip install pillow) to get this as a picture you can save or screenshot.")
+                st.caption("Install Pillow (pip install pillow) to see the order ticket picture.")
         with st.expander("Option chart"):
             link = tv_option_url(o)
             try:
