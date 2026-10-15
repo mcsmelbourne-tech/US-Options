@@ -1,17 +1,20 @@
 """
-US Top-50 Call/Put Scanner - scheduled scans every US trading day (yfinance + Greeks + price action)
+US Top-100 Call/Put Scanner - scheduled scans every US trading day (yfinance + Greeks + price action)
 
-  Scan 1  PREMARKET    09:00 ET - gap, premarket range/volume, trend; option prices are indicative
-  Scan 2  OPEN +10min  09:40 ET - re-scores everything, ADDS the premarket scan result
-                                  (opening-range breakout vs premarket high/low, direction consistency)
-  Scan 3+ HOURLY       10:40, 11:40, 12:40, 13:40, 14:40 ET - fresh picks through the day (volume is judged
-                                  against the time of day; 14:40 is the last, trades exit by 15:45 ET)
+  Scan 1  OPEN 09:45 ET   - first scan of the day (premarket range/gap/volume + the first 15 min of trading)
+  Scan 2+ HOURLY          10:45, 11:45, 12:45, 13:45, 14:45 ET - fresh picks through the day (volume is judged
+                          against the time of day; 14:45 is the last, trades exit by 15:45 ET)
+
+Top of the page: US INDICES box (S&P 500, Dow, Nasdaq, Nasdaq 100, Russell 2000, ... + SPY, QQQ, DIA, IWM)
+                 with price and daily change, and the TOP 10 US SHARES below it (price + daily change).
 
 Per stock: EMA 9 / EMA 15, RSI, MACD, volume (relative to normal), ATR, VWAP, gap
            + PRICE ACTION: swing structure (HH/HL, LH/LL), break of structure (BOS), candle patterns
              (engulfing, hammer, shooting star, strong bar), previous-day high/low breaks, and a
              "blocked" check when the next support/resistance is too close for the expected move.
              The stop loss is placed beyond the last swing low (call) / swing high (put).
+           + ACCURACY FILTERS: the SPY (market) direction must not fight the trade, minimum relative volume,
+             no earnings before the option expires, tighter option liquidity (spread / open interest).
 Per option: Black-Scholes Greeks (delta, gamma, theta, vega, rho) from yfinance implied vol,
             next expiry AFTER today, ranked by Greeks + spread + liquidity + IV vs historical vol.
 Output:     best CALL and best PUT in a box (+ one TOP PICK), predicted day price (close/high/low),
@@ -23,8 +26,9 @@ BACKTEST:   "Backtest" tab (or command line) replays the same scans on the last 
 
 Run:   streamlit run us_itm_scanner.py        (leave the page open - it fires the scans on time)
        python us_itm_scanner.py --backtest 20 (backtest from the command line, 20 trading days)
+       python us_itm_scanner.py --sweep 40    (settings sweep, train on early days / test on later days)
 Needs: pip install streamlit yfinance pandas numpy requests
-Educational use only - estimates are heuristics, not advice.
+Educational use only - estimates are heuristics, not advice. No scanner can guarantee profit.
 """
 
 import csv
@@ -54,13 +58,13 @@ STATE_FILE = "scan_state.json"
 BT_FILE = "backtest_trades.csv"
 SWEEP_FILE = "backtest_sweep.csv"
 
-SCAN_PRE_TIME = dt.time(9, 0)                # premarket scan (ET)
-SCAN_OPEN_TIME = dt.time(9, 40)              # 10 min after the 09:30 open (ET)
-SCAN_OPEN_LATEST = dt.time(10, 30)           # if the app starts late, still run the open scan until here
+SCAN_PRE_TIME = dt.time(9, 0)                # only used by the manual "Premarket scan now" button
+SCAN_OPEN_TIME = dt.time(9, 45)              # first scheduled scan (ET)
+SCAN_OPEN_LATEST = dt.time(10, 30)           # if the app starts late, still run the 09:45 scan until here
 MARKET_OPEN = dt.time(9, 30)
 MARKET_CLOSE = dt.time(16, 0)
 EXIT_TIME = dt.time(15, 45)                  # trades are closed by this time
-HOURLY_TIMES = [dt.time(h, 40) for h in range(10, 15)]   # 10:40 ... 14:40 ET, every hour after the open scan
+HOURLY_TIMES = [dt.time(h, 45) for h in range(10, 15)]   # 10:45 ... 14:45 ET, every hour after the first scan
 HOURLY_GRACE_MIN = 20                                    # a late start can still run an hourly scan this long after its time
 
 
@@ -70,23 +74,28 @@ def _plus(t, minutes):
 
 # (key, mode, start time ET, latest start ET, label) - in time order
 SCHEDULE = (
-    [("pre", "pre", SCAN_PRE_TIME, MARKET_OPEN, "Premarket"),
-     ("open", "open", SCAN_OPEN_TIME, SCAN_OPEN_LATEST, "Open +10min")]
+    [("open", "open", SCAN_OPEN_TIME, SCAN_OPEN_LATEST, "Open 09:45")]
     + [(f"h{t:%H%M}", "hourly", t, _plus(t, HOURLY_GRACE_MIN), f"Hourly {t:%H:%M}") for t in HOURLY_TIMES]
 )
 
 RISK_FREE = 0.04
 CONTRACT_SIZE = 100                          # 1 lot = 1 contract = 100 shares
 
-MIN_SCORE = 3                                # minimum |score| to be considered
+MIN_SCORE = 4                                # minimum |score| to be considered (was 3 - stricter for accuracy)
 STRONG_SCORE = 5                             # |score| for a "strong" signal
-CANDIDATES = 12                              # stocks (best scores) whose option chains are checked
+CANDIDATES = 16                              # stocks (best scores) whose option chains are checked
+
+# accuracy filters
+USE_MARKET_FILTER = True                     # SPY direction adds / removes a point (trade WITH the market)
+MARKET_SYM = "SPY"
+MIN_RVOL = 0.8                               # skip stocks trading on clearly below-normal volume (not applied premarket)
+SKIP_EARNINGS = True                         # live scans: skip when earnings fall before the option expires (IV crush)
 
 # option filters / ranking
 TARGET_DELTA = 0.65
 DELTA_MIN, DELTA_MAX = 0.55, 0.80
-MAX_SPREAD_PCT = 10.0
-MIN_OI = 100
+MAX_SPREAD_PCT = 8.0                         # (was 10)
+MIN_OI = 200                                 # (was 100)
 
 # trade plan (stock based, converted to option prices with the Greeks / Black-Scholes)
 HOLD_HOURS = 6.0                             # time decay assumed before exit
@@ -107,6 +116,8 @@ BT_IV_MULT = 1.10                            # assumed option IV = 20-day histor
 BT_SLIPPAGE = 0.02                           # 2% of premium lost on entry and on stop / time exits
 BT_COMMISSION = 0.65                         # $ per contract per side
 
+WORKERS = 8                                  # parallel downloads
+
 SYMBOLS = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "META",
     "NVDA", "TSLA", "BRK-B", "UNH", "JNJ",
@@ -118,7 +129,29 @@ SYMBOLS = [
     "ABT", "WFC", "DIS", "DHR", "TXN",
     "QCOM", "AMD", "INTC", "IBM", "GS",
     "CAT", "AMGN", "HON", "UNP", "LOW",
+    # ---- 50 more liquid, optionable US stocks ----
+    "PLTR", "UBER", "NOW", "INTU", "ISRG",
+    "NEE", "SPGI", "BLK", "AXP", "MS",
+    "C", "T", "VZ", "CMCSA", "NKE",
+    "SBUX", "PM", "MO", "CVX", "COP",
+    "SLB", "GE", "RTX", "LMT", "BA",
+    "DE", "MMM", "UPS", "FDX", "TGT",
+    "MU", "AMAT", "LRCX", "PANW", "CRWD",
+    "PYPL", "COIN", "ABNB", "MRVL", "ANET",
+    "GILD", "BMY", "CVS", "MDT", "SYK",
+    "VRTX", "REGN", "PGR", "CB", "KLAC",
 ]
+
+# ----- market panels (top of the page) -----
+INDICES = [
+    ("S&P 500", "^GSPC"), ("Dow Jones", "^DJI"), ("Nasdaq Composite", "^IXIC"), ("Nasdaq 100", "^NDX"),
+    ("Russell 2000", "^RUT"), ("S&P MidCap 400", "^MID"), ("NYSE Composite", "^NYA"), ("Semiconductors SOX", "^SOX"),
+    ("VIX (fear index)", "^VIX"), ("SPY - S&P 500 ETF", "SPY"), ("QQQ - Nasdaq 100 ETF", "QQQ"),
+    ("DIA - Dow ETF", "DIA"), ("IWM - Russell 2000 ETF", "IWM"),
+]
+TOP10 = [("Apple", "AAPL"), ("Microsoft", "MSFT"), ("Nvidia", "NVDA"), ("Alphabet", "GOOGL"), ("Amazon", "AMZN"),
+         ("Meta", "META"), ("Broadcom", "AVGO"), ("Tesla", "TSLA"), ("Berkshire B", "BRK-B"), ("Eli Lilly", "LLY")]
+MARKET_REFRESH_SEC = 30
 
 # ----------------------------- CONFIG / STATE / TELEGRAM -----------------------------
 
@@ -459,9 +492,17 @@ def analyse_df(sym, df, dd, mode):
         return None
 
 
-def finalize(a, use_pa=True, pre_prev=None):
+def mkt_dir(a0):
+    """Market (SPY) bias from its indicator score: +1 bullish, -1 bearish, 0 neutral / unknown."""
+    if not a0:
+        return 0
+    s = a0["s_core"]
+    return 1 if s >= 2 else (-1 if s <= -2 else 0)
+
+
+def finalize(a, use_pa=True, pre_prev=None, mkt=0):
     """Final score, day prediction and stop reference. use_pa=False gives the original indicator-only score
-    (used by the backtest to compare)."""
+    (used by the backtest to compare). mkt = market bias from mkt_dir()."""
     a = dict(a)
     sym = a["sym"]
     s, tags = a["s_core"], list(a["tags_core"])
@@ -476,6 +517,9 @@ def finalize(a, use_pa=True, pre_prev=None):
         # premarket scan agreed with today's direction -> strengthen it; disagreed -> weaken it
         agree = (pre_prev[sym] > 0) == (s > 0)
         add((1 if s > 0 else -1) * (1 if agree else -1), "PM-scan")
+    if USE_MARKET_FILTER and mkt and s != 0:
+        # trade with the market: SPY agrees -> +1, SPY fights the trade -> -1
+        add((1 if s > 0 else -1) * (1 if (mkt > 0) == (s > 0) else -1), "Mkt")
     add(*a["ob"])
     if use_pa:
         s += a["pa_s"]
@@ -510,13 +554,41 @@ def pa_agrees(a):
     return a["pa_s"] != 0 and (a["pa_s"] > 0) == (a["score"] > 0)
 
 
-def analyse(sym, mode, pre_prev):
+def analyse(sym, mode, pre_prev, mkt=0):
     """Live analysis (current data) with price action on."""
     try:
         base = analyse_df(sym, fetch_intraday(sym), fetch_daily(sym), mode)
-        return finalize(base, True, pre_prev) if base else None
+        return finalize(base, True, pre_prev, mkt) if base else None
     except Exception:
         return None
+
+
+def market_bias(mode):
+    """Live SPY bias (+1 / 0 / -1)."""
+    if not USE_MARKET_FILTER:
+        return 0
+    try:
+        return mkt_dir(analyse_df(MARKET_SYM, fetch_intraday(MARKET_SYM), fetch_daily(MARKET_SYM), mode))
+    except Exception:
+        return 0
+
+
+def earnings_before(sym, expiry):
+    """True when an earnings date falls between today and the option expiry (IV crush / gap risk)."""
+    try:
+        cal = yf.Ticker(sym).calendar
+        dates = cal.get("Earnings Date") if isinstance(cal, dict) else None
+        if not dates:
+            return False
+        exp = dt.datetime.strptime(expiry, "%Y-%m-%d").date()
+        today = dt.datetime.now(ET).date()
+        for d in dates:
+            d = d.date() if isinstance(d, dt.datetime) else d
+            if today <= d <= exp:
+                return True
+        return False
+    except Exception:
+        return False
 
 # ----------------------------- OPTION PICKER (all Greeks) -----------------------------
 
@@ -653,14 +725,16 @@ def log_picks(res):
 
 def scan_once(mode, pre_prev=None, label=None):
     now = dt.datetime.now(ET)
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        analysed = [a for a in ex.map(lambda s: analyse(s, mode, pre_prev), SYMBOLS) if a]
+    mkt = market_bias(mode)
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        analysed = [a for a in ex.map(lambda s: analyse(s, mode, pre_prev, mkt), SYMBOLS) if a]
 
     table = [dict(symbol=a["sym"], price=round(a["spot"], 2), gap_pct=round(a["gap"], 2), rsi=round(a["rsi"], 1),
                   rvol=round(a["rvol"], 2), score=a["score"], price_action=a["pa_s"], pre_score=a["pre_score"],
                   structure=a["pa"]["struct"], day_est=round(a["pred_close"], 2)) for a in analysed]
 
-    cands = sorted([a for a in analysed if abs(a["score"]) >= MIN_SCORE and (not REQUIRE_PA or pa_agrees(a))],
+    cands = sorted([a for a in analysed if abs(a["score"]) >= MIN_SCORE and (not REQUIRE_PA or pa_agrees(a))
+                    and (mode == "pre" or a["rvol"] >= MIN_RVOL)],
                    key=lambda a: -abs(a["score"]))[:CANDIDATES]
 
     def build(a):
@@ -668,17 +742,19 @@ def scan_once(mode, pre_prev=None, label=None):
         opt = pick_option(a["sym"], a["spot"], side, a["hv"])
         if not opt:
             return None
+        if SKIP_EARNINGS and earnings_before(a["sym"], opt["expiry"]):
+            return None
         plan = trade_plan(opt, a)
         if not plan or plan["rr"] < MIN_RR:
             return None
         rank = abs(a["score"]) * 10 + opt["quality"] * 0.25 + min(plan["rr"], 3.0) * 5
         return dict(side=side, a=a, opt=opt, plan=plan, rank=rank, strong=abs(a["score"]) >= STRONG_SCORE)
 
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         built = [b for b in ex.map(build, cands) if b]
 
-    res = {"mode": mode, "label": label or {"pre": "Premarket", "open": "Open +10min", "hourly": "Hourly"}[mode],
-           "time": now.isoformat(timespec="seconds"), "CALL": None, "PUT": None, "top": None,
+    res = {"mode": mode, "label": label or {"pre": "Premarket", "open": "Open 09:45", "hourly": "Hourly"}[mode],
+           "time": now.isoformat(timespec="seconds"), "CALL": None, "PUT": None, "top": None, "market": mkt,
            "table": table, "scores": {a["sym"]: a["score"] for a in analysed}, "scanned": len(analysed)}
     for b in built:
         if res[b["side"]] is None or b["rank"] > res[b["side"]]["rank"]:
@@ -756,9 +832,10 @@ def run_scheduled(cfg):
 # yfinance only keeps 60 days of 5-minute bars and NO history of option quotes, so the backtest:
 #   1. replays every scan of the SCHEDULE on past days with the data available at that moment (no look-ahead),
 #   2. models the option: strike nearest delta 0.65, next Friday expiry, IV = 20-day HV x BT_IV_MULT, Black-Scholes,
-#   3. enters at the open of the bar after the scan (premarket scan: the 09:30 open), plus slippage,
+#   3. enters at the open of the bar after the scan, plus slippage,
 #   4. walks forward bar by bar: stop loss checked first (worst case) then take profit, otherwise exit 15:45 ET,
 #   5. runs the same scans twice - WITH price action and WITHOUT - so you can see what it adds.
+# The SPY market filter and volume filter are replayed too. The earnings filter is live-only (no history).
 
 def fetch_history(symbols, progress=None):
     """{symbol: (5-min bars incl. premarket, last 60 days ; daily bars, 6 months)}"""
@@ -775,7 +852,7 @@ def fetch_history(symbols, progress=None):
             pass
         return sym, None
 
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         futures = [ex.submit(one, s) for s in symbols]
         for n, fut in enumerate(as_completed(futures), 1):      # progress is reported from the main thread
             sym, val = fut.result()
@@ -872,11 +949,18 @@ def prepare_backtest(data, days=20, progress=None):
             entry_ts = max(when, pd.Timestamp(dt.datetime.combine(day, MARKET_OPEN), tz=ET))
             base = []
             for sym, (df, dd) in data.items():
+                if sym == MARKET_SYM and MARKET_SYM not in SYMBOLS:      # SPY is only the market filter
+                    continue
                 i = df.index.searchsorted(when)
                 a0 = analyse_df(sym, df.iloc[max(0, i - 720):i], dd, mode)
                 if a0:
                     base.append(a0)
-            prep.append(dict(day=day, mode=mode, label=label, entry_ts=entry_ts, exit_ts=exit_ts, base=base))
+            mkt = 0
+            if USE_MARKET_FILTER and MARKET_SYM in data:
+                df_m, dd_m = data[MARKET_SYM]
+                i = df_m.index.searchsorted(when)
+                mkt = mkt_dir(analyse_df(MARKET_SYM, df_m.iloc[max(0, i - 720):i], dd_m, mode))
+            prep.append(dict(day=day, mode=mode, label=label, entry_ts=entry_ts, exit_ts=exit_ts, base=base, mkt=mkt))
         if progress:
             progress((di + 1) / len(test_days), f"Reading signals, day {di + 1}/{len(test_days)} ({day})")
     return prep
@@ -885,9 +969,9 @@ def prepare_backtest(data, days=20, progress=None):
 def run_backtest(data, days=20, iv_mult=BT_IV_MULT, slip=BT_SLIPPAGE, commission=BT_COMMISSION, progress=None,
                  prep=None, params=None, variants=None):
     """One row per trade. params (all optional) override tp_frac, sl_frac, min_loss, max_loss, min_score, min_rr,
-    require_pa. variants = {name: use_price_action}; default compares with / without price action."""
+    require_pa, min_rvol. variants = {name: use_price_action}; default compares with / without price action."""
     p = dict(tp_frac=TP_FRAC, sl_frac=SL_MOVE_FRAC, min_loss=MIN_LOSS, max_loss=MAX_LOSS,
-             min_score=MIN_SCORE, min_rr=MIN_RR, require_pa=REQUIRE_PA, random_dir=None)
+             min_score=MIN_SCORE, min_rr=MIN_RR, require_pa=REQUIRE_PA, min_rvol=MIN_RVOL, random_dir=None)
     p.update(params or {})
     variants = variants or {"Price action": True, "Indicators only": False}
     if prep is None:
@@ -900,11 +984,13 @@ def run_backtest(data, days=20, iv_mult=BT_IV_MULT, slip=BT_SLIPPAGE, commission
         if day != cur_day:
             cur_day, pre_scores, taken = day, {v: {} for v in variants}, set()
         for vname, use_pa in variants.items():
-            fin = [finalize(a0, use_pa, pre_scores[vname] if mode != "pre" else None) for a0 in sc["base"]]
+            fin = [finalize(a0, use_pa, pre_scores[vname] if mode != "pre" else None, sc.get("mkt", 0))
+                   for a0 in sc["base"]]
             if mode == "pre":
                 pre_scores[vname] = {a["sym"]: a["score"] for a in fin}
             cands = sorted([a for a in fin if abs(a["score"]) >= p["min_score"]
-                            and not (p["require_pa"] and use_pa and not pa_agrees(a))],
+                            and not (p["require_pa"] and use_pa and not pa_agrees(a))
+                            and (mode == "pre" or a["rvol"] >= p["min_rvol"])],
                            key=lambda a: -abs(a["score"]))[:CANDIDATES]
             best = {"CALL": None, "PUT": None}
             for a in cands:
@@ -1037,10 +1123,14 @@ def _breakdown(tr, col):
 
 # ----------------------------- TELEGRAM TEXT (compact) -----------------------------
 
+def _bias_txt(m):
+    return "bullish" if m > 0 else ("bearish" if m < 0 else "neutral")
+
+
 def telegram_text(res):
     when = dt.datetime.fromisoformat(res["time"])
     title = "PREMARKET (indicative)" if res["mode"] == "pre" else res.get("label", "SCAN").upper()
-    lines = [f"📊 {title} · {when.strftime('%H:%M')} ET"]
+    lines = [f"📊 {title} · {when.strftime('%H:%M')} ET · market {_bias_txt(res.get('market', 0))}"]
     shown = False
     for side in ("CALL", "PUT"):
         it = res.get(side)
@@ -1072,6 +1162,57 @@ def fmt_local(when):
 def tv_url(sym, interval="5"):
     """TradingView chart for the stock (5-minute by default). Yahoo's BRK-B style becomes BRK.B."""
     return f"https://www.tradingview.com/chart/?symbol={sym.replace('-', '.')}&interval={interval}"
+
+
+# ----- market panels: indices box + top 10 shares -----
+def get_quote(sym):
+    """{price, chg, pct} vs the previous close, or None."""
+    px = prev = None
+    try:
+        fi = yf.Ticker(sym).fast_info
+        px, prev = float(fi["last_price"]), float(fi["previous_close"])
+    except Exception:
+        px = prev = None
+    if not px or not prev or px != px or prev != prev:
+        try:
+            d = yf.Ticker(sym).history(period="5d", interval="1d")["Close"].dropna()
+            if len(d) < 2:
+                return None
+            px, prev = float(d.iloc[-1]), float(d.iloc[-2])
+        except Exception:
+            return None
+    return dict(price=px, chg=px - prev, pct=(px / prev - 1) * 100)
+
+
+@st.cache_data(ttl=MARKET_REFRESH_SEC, show_spinner=False)
+def market_quotes(symbols):
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        return dict(zip(symbols, ex.map(get_quote, symbols)))
+
+
+def _metric_grid(items, quotes, ncol=5):
+    for i in range(0, len(items), ncol):
+        cols = st.columns(ncol)
+        for c, (name, sym) in zip(cols, items[i:i + ncol]):
+            d = quotes.get(sym)
+            with c:
+                if not d:
+                    st.metric(name, "n/a")
+                    continue
+                st.metric(name, f"{d['price']:,.2f}", f"{d['chg']:+,.2f} ({d['pct']:+.2f}%)",
+                          delta_color="inverse" if sym == "^VIX" else "normal")
+
+
+def render_market(box):
+    syms = tuple(s for _, s in INDICES) + tuple(s for _, s in TOP10)
+    q = market_quotes(syms)
+    with box.container():
+        with st.container(border=True):
+            st.markdown("**US indices** - price and change on the day")
+            _metric_grid(INDICES, q)
+        with st.container(border=True):
+            st.markdown("**Top 10 US shares** - price and change on the day")
+            _metric_grid([(f"{n} ({s})", s) for n, s in TOP10], q)
 
 
 # ----- Moomoo-style order ticket (dark panel, inline styles only) -----
@@ -1176,8 +1317,9 @@ def draw_box(item, side, is_top):
     if not item:
         with st.container(border=True):
             st.subheader(f"{icon} {side}")
-            st.info("No qualifying contract (needs |score| >= 3, next expiry, delta 0.55-0.80, spread <= 10%, "
-                    "OI >= 100, reward:risk >= 1.3).")
+            st.info(f"No qualifying contract (needs |score| >= {MIN_SCORE}, volume >= {MIN_RVOL}x normal, "
+                    f"no earnings before expiry, next expiry, delta {DELTA_MIN}-{DELTA_MAX}, spread <= {MAX_SPREAD_PCT:g}%, "
+                    f"OI >= {MIN_OI}, reward:risk >= {MIN_RR}). Waiting for a cleaner setup is intended.")
         return
     o, p, a = item["opt"], item["plan"], item["a"]
     with st.container(border=True):
@@ -1246,7 +1388,8 @@ def render_scan(res, empty_msg):
     when = dt.datetime.fromisoformat(res["time"])
     tg = " | Telegram sent ✅" if res.get("telegram") else ""
     st.write(f"Scan time: **{when.strftime('%a %d %b %H:%M')} ET** ({fmt_local(when)} your time) | "
-             f"{res.get('scanned', '?')}/{len(SYMBOLS)} stocks read{tg}")
+             f"{res.get('scanned', '?')}/{len(SYMBOLS)} stocks read | "
+             f"{MARKET_SYM} market bias: **{_bias_txt(res.get('market', 0))}**{tg}")
     draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL")
     draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT")
     with st.expander("All stocks - direction score & day estimate"):
@@ -1302,7 +1445,8 @@ def render_backtest_tab():
                "yfinance keeps only 60 days of 5-minute data and no option history, so the option is MODELLED with "
                "Black-Scholes (strike nearest delta 0.65, next Friday expiry, IV = 20-day HV x multiplier, constant IV). "
                "Stop loss is checked before take profit inside the same bar. Results are estimates, not a promise. "
-               "While it runs (a few minutes) the live auto-scan loop is paused.")
+               "With 100 stocks the download and signal reading take several minutes; the live auto-scan loop is "
+               "paused while it runs.")
     c1, c2, c3, c4 = st.columns(4)
     days = c1.slider("Trading days", 5, 40, 20)
     iv_mult = c2.slider("Option IV vs 20-day HV (x)", 0.8, 1.6, BT_IV_MULT, 0.05)
@@ -1314,7 +1458,8 @@ def render_backtest_tab():
         """Download + read signals once; kept for the sweep so it does not repeat the slow part."""
         key = (days, nsym)
         if st.session_state.get("bt_key") != key:
-            data = fetch_history(SYMBOLS[:nsym], cb)
+            syms = list(SYMBOLS[:nsym]) + ([MARKET_SYM] if MARKET_SYM not in SYMBOLS[:nsym] else [])
+            data = fetch_history(syms, cb)
             if not data:
                 return None, None
             st.session_state.update(bt_data=data, bt_prep=prepare_backtest(data, days, cb), bt_key=key)
@@ -1388,9 +1533,10 @@ def show_sweep(sw):
 
 
 def cli_sweep(days):
-    print(f"Downloading history for {len(SYMBOLS)} stocks ...")
-    data = fetch_history(SYMBOLS, lambda f, t: None)
-    print(f"{len(data)} stocks. Reading signals for {days} days (slow, once) ...")
+    syms = list(SYMBOLS) + ([MARKET_SYM] if MARKET_SYM not in SYMBOLS else [])
+    print(f"Downloading history for {len(syms)} symbols ...")
+    data = fetch_history(syms, lambda f, t: None)
+    print(f"{len(data)} symbols. Reading signals for {days} days (slow, once) ...")
     prep = prepare_backtest(data, days)
     sw = run_sweep(data, prep)
     if sw.empty:
@@ -1407,9 +1553,10 @@ def cli_sweep(days):
 
 
 def cli_backtest(days):
-    print(f"Downloading history for {len(SYMBOLS)} stocks ...")
-    data = fetch_history(SYMBOLS, lambda f, t: None)
-    print(f"{len(data)} stocks with data. Running {days}-day backtest ...")
+    syms = list(SYMBOLS) + ([MARKET_SYM] if MARKET_SYM not in SYMBOLS else [])
+    print(f"Downloading history for {len(syms)} symbols ...")
+    data = fetch_history(syms, lambda f, t: None)
+    print(f"{len(data)} symbols with data. Running {days}-day backtest ...")
     tr = run_backtest(data, days)
     if tr.empty:
         print("No trades.")
@@ -1428,9 +1575,9 @@ def main():
     st.set_page_config(page_title="US Call/Put Scanner", layout="wide")
     cfg = load_config()
 
-    st.title("📈 US Top-50 Call / Put Scanner")
-    st.caption("Scans: premarket 09:00 ET, open +10 min 09:40 ET, then every hour 10:40-14:40 ET - each one is sent to "
-               "Telegram. Next expiry (not same day) - all Greeks + price action - educational only, not advice.")
+    st.title("📈 US Top-100 Call / Put Scanner")
+    st.caption("Scans: 09:45 ET, then every hour 10:45-14:45 ET - each one is sent to Telegram. Next expiry (not same "
+               "day) - all Greeks + price action + market filter - educational only, not advice.")
 
     with st.sidebar:
         auto = st.toggle("Auto scans (see schedule)", value=True)
@@ -1446,14 +1593,18 @@ def main():
                 st.success("Sent") if send_telegram(cfg, "✅ Scanner test message") else st.error("Not sent")
         st.markdown("**Manual run** (screen only, no Telegram)")
         run_pre = st.button("Premarket scan now")
-        run_open = st.button("Open scan now")
+        run_open = st.button("Open-style scan now")
         run_hourly = st.button("Hourly-style scan now")
+
+    # indices box + top 10 shares first, so they show while a scan is running
+    mkt_box = st.empty()
+    render_market(mkt_box)
 
     if auto:
         run_scheduled(cfg)
 
     manual = st.session_state.setdefault("manual", {})
-    for flag, mode, label in ((run_pre, "pre", "Premarket (manual)"), (run_open, "open", "Open +10min (manual)"),
+    for flag, mode, label in ((run_pre, "pre", "Premarket (manual)"), (run_open, "open", "Open (manual)"),
                               (run_hourly, "hourly", "Hourly (manual)")):
         if flag:
             with st.spinner(f"Scanning {len(SYMBOLS)} stocks..."):
@@ -1486,14 +1637,11 @@ def main():
         a, b = scheduled.get(key), manual.get(mode)
         return max([x for x in (a, b) if ok(x)], key=when_of) if (ok(a) or ok(b)) else (state.get(key) or None)
 
-    t_latest, t_pre, t_open, t_hour, t_bt = st.tabs(["Latest scan", "Premarket", "Open +10min", "Hourly scans",
-                                                     "Backtest"])
+    t_latest, t_open, t_hour, t_bt = st.tabs(["Latest scan", "Open 09:45", "Hourly scans", "Backtest"])
     with t_latest:
-        render_scan(latest, "No scan yet - the first one runs at 09:00 ET (or use a manual run).")
-    with t_pre:
-        render_scan(newest("pre", "pre"), "No premarket scan yet - runs at 09:00 ET.")
+        render_scan(latest, "No scan yet - the first one runs at 09:45 ET (or use a manual run).")
     with t_open:
-        render_scan(newest("open", "open"), "No open scan yet - runs at 09:40 ET.")
+        render_scan(newest("open", "open"), "No open scan yet - runs at 09:45 ET.")
     with t_hour:
         hourly = sorted([r for r in everything if r.get("mode") == "hourly"], key=when_of, reverse=True)
         if hourly:
@@ -1501,16 +1649,20 @@ def main():
             pick = st.selectbox("Hourly scan", names, index=0)
             render_scan(hourly[names.index(pick)], "")
         else:
-            st.info("No hourly scan yet - they run at 10:40, 11:40, 12:40, 13:40 and 14:40 ET.")
+            st.info("No hourly scan yet - they run at 10:45, 11:45, 12:45, 13:45 and 14:45 ET.")
     with t_bt:
         render_backtest_tab()
 
     if auto:
         box = st.empty()
+        last_mkt = time.time()
         while True:
             now = dt.datetime.now(ET)
             if due_scan(now, load_state()):
                 st.rerun()
+            if time.time() - last_mkt >= MARKET_REFRESH_SEC:          # keep the index / top-10 prices fresh
+                render_market(mkt_box)
+                last_mkt = time.time()
             entry, when = next_scan(now)
             left = int((when - now).total_seconds())
             box.caption(f"Next: **{entry[4]}** at {when.strftime('%a %H:%M')} ET ({fmt_local(when)} your time) - in "
