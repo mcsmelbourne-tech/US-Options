@@ -2,7 +2,7 @@
 US Top-100 Call/Put Scanner - scheduled scans every US trading day (yfinance + Greeks + price action)
 
   Scan 1  OPEN 09:45 ET   - first scan of the day (premarket range/gap/volume + the first 15 min of trading)
-  Scan 2+ HOURLY          10:45, 11:45, 12:45, 13:45, 14:45 ET - fresh picks through the day (volume is judged
+  Scan 2+ EVERY 30 MIN    10:15, 10:45, 11:15 ... 14:15, 14:45 ET - fresh picks through the day (volume is judged
                           against the time of day; 14:45 is the last, trades exit by 15:45 ET)
 
 Top of the page: US INDICES box (S&P 500, Dow, Nasdaq, Nasdaq 100, Russell 2000, ... + SPY, QQQ, DIA, IWM)
@@ -148,7 +148,7 @@ SCAN_OPEN_LATEST = dt.time(10, 30)           # if the app starts late, still run
 MARKET_OPEN = dt.time(9, 30)
 MARKET_CLOSE = dt.time(16, 0)
 EXIT_TIME = dt.time(15, 45)                  # trades are closed by this time
-HOURLY_TIMES = [dt.time(h, 45) for h in range(10, 15)]   # 10:45 ... 14:45 ET, every hour after the first scan
+HOURLY_TIMES = [dt.time(h, m) for h in range(10, 15) for m in (15, 45)]   # 10:15, 10:45 ... 14:15, 14:45 ET - every 30 minutes after the first scan
 HOURLY_GRACE_MIN = 20                                    # a late start can still run an hourly scan this long after its time
 
 
@@ -159,7 +159,7 @@ def _plus(t, minutes):
 # (key, mode, start time ET, latest start ET, label) - in time order
 SCHEDULE = (
     [("open", "open", SCAN_OPEN_TIME, SCAN_OPEN_LATEST, "Open 09:45")]
-    + [(f"h{t:%H%M}", "hourly", t, _plus(t, HOURLY_GRACE_MIN), f"Hourly {t:%H:%M}") for t in HOURLY_TIMES]
+    + [(f"h{t:%H%M}", "hourly", t, _plus(t, HOURLY_GRACE_MIN), f"Scan {t:%H:%M}") for t in HOURLY_TIMES]
 )
 
 RISK_FREE = 0.04
@@ -856,7 +856,7 @@ def scan_once(mode, pre_prev=None, label=None):
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         built = [b for b in ex.map(build, cands) if b]
 
-    res = {"mode": mode, "label": label or {"pre": "Premarket", "open": "Open 09:45", "hourly": "Hourly"}[mode],
+    res = {"mode": mode, "label": label or {"pre": "Premarket", "open": "Open 09:45", "hourly": "30-min scan"}[mode],
            "time": now.isoformat(timespec="seconds"), "CALL": None, "PUT": None, "top": None, "market": mkt,
            "table": table, "scores": {a["sym"]: a["score"] for a in analysed}, "scanned": len(analysed)}
     for b in built:
@@ -2268,7 +2268,7 @@ def run_daemon():
     threading.Thread(target=_heartbeat_loop, args=(stop,), daemon=True).start()
     cfg = load_config()
     _dlog("Background scanner started")
-    send_telegram(cfg, "✅ Scanner background service started - scans 09:45 ET + hourly to 14:45 ET, commodities hourly.")
+    send_telegram(cfg, "✅ Scanner background service started - scans 09:45 ET then every 30 min to 14:45 ET, commodities hourly.")
     try:
         while True:
             cfg = load_config()                      # picks up a changed Telegram token without a restart
@@ -2321,7 +2321,7 @@ def main():
     cfg = load_config()
 
     st.title("📈 US Top-100 Call / Put Scanner")
-    st.caption("Scans: 09:45 ET, then every hour 10:45-14:45 ET - each one is sent to Telegram. Next expiry (not same "
+    st.caption("Scans: 09:45 ET, then every 30 minutes 10:15-14:45 ET - each one is sent to Telegram. Next expiry (not same "
                "day) - all Greeks + price action + market filter - educational only, not advice.")
 
     with st.sidebar:
@@ -2347,7 +2347,7 @@ def main():
     bc = top.columns([1, 1, 1, 1.4])
     run_pre = bc[0].button("▶ Premarket scan now")
     run_open = bc[1].button("▶ Open-style scan now")
-    run_hourly = bc[2].button("▶ Hourly-style scan now")
+    run_hourly = bc[2].button("▶ 30-min scan now")
     tg_manual = bc[3].checkbox("Send manual scan to Telegram", value=True)
     mkt_box = st.empty()
     render_market(mkt_box)
@@ -2359,7 +2359,7 @@ def main():
 
     manual = st.session_state.setdefault("manual", {})
     for flag, mode, label in ((run_pre, "pre", "Premarket (manual)"), (run_open, "open", "Open (manual)"),
-                              (run_hourly, "hourly", "Hourly (manual)")):
+                              (run_hourly, "hourly", "30-min (manual)")):
         if flag:
             with st.spinner(f"Scanning {len(SYMBOLS)} stocks..."):
                 manual[mode] = scan_once(mode, pre_scores_today(load_state()) if mode != "pre" else None, label)
@@ -2394,7 +2394,7 @@ def main():
         a, b = scheduled.get(key), manual.get(mode)
         return max([x for x in (a, b) if ok(x)], key=when_of) if (ok(a) or ok(b)) else (state.get(key) or None)
 
-    t_latest, t_open, t_hour, t_bt = top.tabs(["Latest scan", "Open 09:45", "Hourly scans", "Backtest"])
+    t_latest, t_open, t_hour, t_bt = top.tabs(["Latest scan", "Open 09:45", "30-min scans", "Backtest"])
     with t_latest:
         render_scan(latest, "No scan yet - the first one runs at 09:45 ET (or use a manual run).", "latest")
     with t_open:
@@ -2402,11 +2402,11 @@ def main():
     with t_hour:
         hourly = sorted([r for r in everything if r.get("mode") == "hourly"], key=when_of, reverse=True)
         if hourly:
-            names = [f"{h.get('label', 'Hourly')} - {when_of(h):%a %H:%M} ET" for h in hourly]
-            pick = st.selectbox("Hourly scan", names, index=0)
+            names = [f"{h.get('label', 'Scan')} - {when_of(h):%a %H:%M} ET" for h in hourly]
+            pick = st.selectbox("30-min scan", names, index=0)
             render_scan(hourly[names.index(pick)], "", "hour")
         else:
-            st.info("No hourly scan yet - they run at 10:45, 11:45, 12:45, 13:45 and 14:45 ET.")
+            st.info("No 30-minute scan yet - they run at 10:15, 10:45, 11:15 ... 14:15 and 14:45 ET.")
     with t_bt:
         render_backtest_tab()
 
