@@ -17,7 +17,8 @@ Per stock: EMA 9 / EMA 15, RSI, MACD, volume (relative to normal), ATR, VWAP, ga
              no earnings before the option expires, tighter option liquidity (spread / open interest).
 Per option: Black-Scholes Greeks (delta, gamma, theta, vega, rho) from yfinance implied vol,
             next expiry AFTER today, ranked by Greeks + spread + liquidity + IV vs historical vol.
-Output:     best CALL and best PUT in a box (+ one TOP PICK), predicted day price (close/high/low),
+Output:     best CALL and best PUT in a box (+ one TOP PICK) with the OPTION contract chart (premium candles with
+            entry / TP / SL lines, like the Moomoo option chart), predicted day price (close/high/low),
             entry, stop loss, take profit, profit for 1 lot. Compact Telegram alert for each scan.
 
 BACKTEST:   "Backtest" tab (or command line) replays the same scans on the last N trading days of 5-minute
@@ -27,7 +28,7 @@ BACKTEST:   "Backtest" tab (or command line) replays the same scans on the last 
 Run:   streamlit run us_itm_scanner.py        (leave the page open - it fires the scans on time)
        python us_itm_scanner.py --backtest 20 (backtest from the command line, 20 trading days)
        python us_itm_scanner.py --sweep 40    (settings sweep, train on early days / test on later days)
-Needs: pip install streamlit yfinance pandas numpy requests
+Needs: pip install streamlit yfinance pandas numpy requests plotly
 Educational use only - estimates are heuristics, not advice. No scanner can guarantee profit.
 """
 
@@ -655,7 +656,8 @@ def pick_option(sym, spot, side, hv):
                              strike=float(o["strike"]), bid=bid, ask=ask, last=last, entry=entry,
                              iv=iv, iv_ratio=iv_ratio, vol=vol, oi=oi, spread=spread, market_open=market_open,
                              delta=g["delta"], gamma=g["gamma"], theta=g["theta"], vega=g["vega"], rho=g["rho"],
-                             quality=quality))
+                             quality=quality,
+                             contract=str(o.get("contractSymbol") or occ_symbol(sym, expiry, side, float(o["strike"])))))
         return max(rows, key=lambda x: x["quality"]) if rows else None
     except Exception:
         return None
@@ -1145,7 +1147,7 @@ def telegram_text(res):
             f"Δ{o['delta']:.2f} Γ{o['gamma']:.3f} Θ{o['theta']:.2f} V{o['vega']:.2f} ρ{o['rho']:.2f} IV{o['iv'] * 100:.0f}%",
             f"Stock {a['spot']:.2f} → day est {a['pred_close']:.2f} (H {a['pred_high']:.2f} / L {a['pred_low']:.2f})",
         ]
-        lines.append(f"Chart: {tv_url(o['symbol'])}")
+        lines.append(f"Option chart: {tv_option_url(o)}")
         pa_txt = " ".join(t.replace("PA:", "") for t in a["pa_tags"] + (["PA:blocked"] if "PA:blocked" in a["tags"] else []))
         if pa_txt:
             lines.append(f"Price action: {a['pa']['struct']} | {pa_txt}")
@@ -1162,6 +1164,89 @@ def fmt_local(when):
 def tv_url(sym, interval="5"):
     """TradingView chart for the stock (5-minute by default). Yahoo's BRK-B style becomes BRK.B."""
     return f"https://www.tradingview.com/chart/?symbol={sym.replace('-', '.')}&interval={interval}"
+
+
+# ----- option contract chart (replaces the stock chart) -----
+def occ_symbol(sym, expiry, side, strike):
+    """OCC / Yahoo contract symbol, e.g. AAPL261016C00250000."""
+    return (f"{sym.replace('-', '')}{expiry[2:4]}{expiry[5:7]}{expiry[8:10]}"
+            f"{'C' if side == 'CALL' else 'P'}{int(round(strike * 1000)):08d}")
+
+
+def opt_code(o):
+    """Moomoo-style contract code, e.g. 261016 250C."""
+    return f"{o['expiry'][2:4]}{o['expiry'][5:7]}{o['expiry'][8:10]} {o['strike']:g}{'C' if o['side'] == 'CALL' else 'P'}"
+
+
+def tv_option_url(o):
+    """TradingView chart of the OPTION contract itself (OPRA). Needs OPRA data in your TradingView plan."""
+    k = f"{o['strike']:.3f}".rstrip("0")
+    k = k + "0" if k.endswith(".") else k
+    return (f"https://www.tradingview.com/chart/?symbol=OPRA:{o['symbol'].replace('-', '')}"
+            f"{o['expiry'][2:4]}{o['expiry'][5:7]}{o['expiry'][8:10]}{'C' if o['side'] == 'CALL' else 'P'}{k}")
+
+
+OPT_CHART_TRIES = (("5m", "5d"), ("15m", "1mo"), ("1h", "3mo"), ("1d", "6mo"))
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def option_bars(contract):
+    """Price bars of the option contract itself (the premium, like the Moomoo option chart). Finest interval that has data."""
+    for interval, period in OPT_CHART_TRIES:
+        try:
+            d = yf.Ticker(contract).history(period=period, interval=interval)
+            if d is not None and len(d) >= 3:
+                d = d.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]].dropna()
+                if len(d) >= 3:
+                    return _to_et(d), interval
+        except Exception:
+            continue
+    return None, None
+
+
+def option_chart(item):
+    """Candles of the option premium + your entry / take profit / stop loss and the bid / ask lines."""
+    o, p = item["opt"], item["plan"]
+    c = st.columns(5)
+    c[0].metric("Last", f"{o['last']:.2f}" if o["last"] else "--")
+    c[1].metric("Bid", f"{o['bid']:.2f}" if o["market_open"] else "--")
+    c[2].metric("Ask", f"{o['ask']:.2f}" if o["market_open"] else "--")
+    c[3].metric("Volume", f"{o['vol']:,}")
+    c[4].metric("Open interest", f"{o['oi']:,}")
+    bars, interval = option_bars(o["contract"])
+    if bars is None:
+        st.caption(f"No price history from Yahoo for {o['contract']} yet (few or no trades). "
+                   f"Entry {p['entry']:.2f} | TP {p['tp']:.2f} | SL {p['sl']:.2f}. Use the TradingView / Moomoo chart.")
+        return
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        st.line_chart(bars["close"])
+        st.caption("Install plotly (pip install plotly) to get the candlestick chart with entry / TP / SL lines.")
+        return
+    bars = bars.copy()
+    bars.index = bars.index.tz_localize(None)                     # keep New York wall-clock time on the axis
+    fig = go.Figure(go.Candlestick(x=bars.index, open=bars["open"], high=bars["high"], low=bars["low"],
+                                   close=bars["close"], increasing_line_color=_GRN, decreasing_line_color=_RED,
+                                   name="Option"))
+    for y, name, col in ((p["entry"], "Entry", _BLU), (p["tp"], "TP", _GRN), (p["sl"], "SL", _RED)):
+        fig.add_hline(y=y, line_dash="dash", line_color=col, annotation_text=f"{name} {y:.2f}",
+                      annotation_position="top right")
+    if o["market_open"]:
+        fig.add_hline(y=o["ask"], line_dash="dot", line_color=_MUT, annotation_text=f"Ask {o['ask']:.2f}",
+                      annotation_position="top left")
+        fig.add_hline(y=o["bid"], line_dash="dot", line_color=_MUT, annotation_text=f"Bid {o['bid']:.2f}",
+                      annotation_position="bottom left")
+    breaks = [dict(bounds=["sat", "mon"])]
+    if interval != "1d":
+        breaks.append(dict(bounds=[16, 9.5], pattern="hour"))      # hide nights, show only the 09:30-16:00 session
+    fig.update_xaxes(rangebreaks=breaks)
+    fig.update_layout(template="plotly_dark", height=380, xaxis_rangeslider_visible=False,
+                      margin=dict(l=10, r=10, t=40, b=10), yaxis_title="Option price (USD)",
+                      title=f"{o['symbol']} {opt_code(o)} - {interval} candles")
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("Prices are the option's own premium from Yahoo Finance and can lag the Moomoo screen by up to ~15 minutes "
+               "(thin contracts show gaps). Bid / ask lines are the quote at scan time - always confirm in Moomoo before entry.")
 
 
 # ----- market panels: indices box + top 10 shares -----
@@ -1294,8 +1379,8 @@ def order_ticket_html(item):
         f'<div style="background:{_BG};border-radius:8px;padding:14px 16px;max-width:340px;'
         f'font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:{_TXT}">'
         f'<div style="font-size:16px;font-weight:600">Trade</div>'
-        f'<div style="font-size:12px;margin-top:2px"><a href="{tv_url(o["symbol"])}" target="_blank" rel="noopener" '
-        f'style="color:{_BLU};text-decoration:none">{o["symbol"]} - {o["side"]} - open chart in TradingView &#8599;</a></div>'
+        f'<div style="font-size:12px;margin-top:2px"><a href="{tv_option_url(o)}" target="_blank" rel="noopener" '
+        f'style="color:{_BLU};text-decoration:none">{o["symbol"]} - {o["side"]} - open option chart in TradingView &#8599;</a></div>'
         f'{tabs}{contract_side}'
         f'{_lab("Session")}{_box("RTH only", color=_MUT)}'
         f'{_lab("Order Type")}{_box("Limit<span style=float:right>&#8964;</span>")}'
@@ -1312,7 +1397,7 @@ def order_ticket_html(item):
     return html
 
 
-def draw_box(item, side, is_top):
+def draw_box(item, side, is_top, ns=""):
     icon = "🟢" if side == "CALL" else "🔴"
     if not item:
         with st.container(border=True):
@@ -1324,11 +1409,11 @@ def draw_box(item, side, is_top):
     o, p, a = item["opt"], item["plan"], item["a"]
     with st.container(border=True):
         st.subheader(f"{icon} {side} - {o['symbol']}" + ("   ⭐ TOP PICK" if is_top else ""))
-        link = tv_url(o["symbol"])
+        link = tv_option_url(o)
         try:
-            st.link_button(f"📈 Open {o['symbol']} chart in TradingView", link)
+            st.link_button(f"📈 {o['symbol']} {opt_code(o)} option chart on TradingView (OPRA)", link)
         except AttributeError:                                  # older Streamlit
-            st.markdown(f"[📈 Open {o['symbol']} chart in TradingView]({link})")
+            st.markdown(f"[📈 {o['symbol']} {opt_code(o)} option chart on TradingView (OPRA)]({link})")
         pre = f" | premarket scan score {a['pre_score']}" if a.get("pre_score") is not None else ""
         st.caption(f"{'STRONG' if item['strong'] else 'Moderate'} signal | score {a['score']}{pre} | "
                    f"{' '.join(a['tags'])}")
@@ -1373,9 +1458,11 @@ def draw_box(item, side, is_top):
                        "otherwise by 15:45 ET.")
         with right:
             st.markdown(order_ticket_html(item), unsafe_allow_html=True)
+        if st.toggle(f"Show {o['symbol']} {opt_code(o)} option chart", value=True, key=f"oc_{ns}_{side}_{o['contract']}"):
+            option_chart(item)
 
 
-def render_scan(res, empty_msg):
+def render_scan(res, empty_msg, ns=""):
     if not res:
         st.info(empty_msg)
         return
@@ -1390,8 +1477,8 @@ def render_scan(res, empty_msg):
     st.write(f"Scan time: **{when.strftime('%a %d %b %H:%M')} ET** ({fmt_local(when)} your time) | "
              f"{res.get('scanned', '?')}/{len(SYMBOLS)} stocks read | "
              f"{MARKET_SYM} market bias: **{_bias_txt(res.get('market', 0))}**{tg}")
-    draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL")
-    draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT")
+    draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL", f"{ns}{res['time']}")
+    draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT", f"{ns}{res['time']}")
     with st.expander("All stocks - direction score & day estimate"):
         if res.get("table"):
             st.dataframe(pd.DataFrame(res["table"]).sort_values("score", key=abs, ascending=False))
@@ -1639,15 +1726,15 @@ def main():
 
     t_latest, t_open, t_hour, t_bt = st.tabs(["Latest scan", "Open 09:45", "Hourly scans", "Backtest"])
     with t_latest:
-        render_scan(latest, "No scan yet - the first one runs at 09:45 ET (or use a manual run).")
+        render_scan(latest, "No scan yet - the first one runs at 09:45 ET (or use a manual run).", "latest")
     with t_open:
-        render_scan(newest("open", "open"), "No open scan yet - runs at 09:45 ET.")
+        render_scan(newest("open", "open"), "No open scan yet - runs at 09:45 ET.", "open")
     with t_hour:
         hourly = sorted([r for r in everything if r.get("mode") == "hourly"], key=when_of, reverse=True)
         if hourly:
             names = [f"{h.get('label', 'Hourly')} - {when_of(h):%a %H:%M} ET" for h in hourly]
             pick = st.selectbox("Hourly scan", names, index=0)
-            render_scan(hourly[names.index(pick)], "")
+            render_scan(hourly[names.index(pick)], "", "hour")
         else:
             st.info("No hourly scan yet - they run at 10:45, 11:45, 12:45, 13:45 and 14:45 ET.")
     with t_bt:
