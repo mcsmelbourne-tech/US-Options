@@ -186,7 +186,14 @@ HOLD_HOURS = 6.0                             # time decay assumed before exit
 TP_FRAC = 1.0                                # stock target = this x the expected move (smaller = closer target, higher win rate)
 SL_MOVE_FRAC = 0.5                           # stock stop = 50% of the expected move against the trade
 MIN_LOSS, MAX_LOSS = 0.10, 0.30              # option stop loss clamped to 10-30% of premium
-MIN_RR = 1.3                                 # skip trades with reward:risk below this
+MIN_RR = 1.5                                 # skip trades with reward:risk below this (was 1.3 - safer)
+# take profit is set from the trend, not a fixed number: STRONG trend = target at 80% of the expected day move,
+# moderate = 60%; it always stops SHORT of the next support / resistance, and the reward is capped at MAX_RR x the risk
+# (a very distant target is a low-probability one). Safer = closer targets that actually get hit.
+TP_FRAC_STRONG = 0.8
+TP_FRAC_MOD = 0.6
+ROOM_BUFFER = 0.9                            # target = at most 90% of the distance to the next support / resistance
+MAX_RR = 2.5
 REQUIRE_PA = False                           # True = only trade when price action points the same way as the trade
 # TP_FRAC / SL_MOVE_FRAC / MAX_LOSS / MIN_SCORE / MIN_RR / REQUIRE_PA are what the Backtest tab's "Sweep" tunes -
 # copy the values it finds here (live scans and the backtest both read these).
@@ -768,6 +775,7 @@ def trade_plan(opt, a, tp_frac=None, sl_frac=None, min_loss=None, max_loss=None)
     """Stock targets from the day prediction, converted to option prices with Black-Scholes.
        With price action on, the stock stop goes just beyond the last swing low (call) / swing high (put).
        tp_frac / sl_frac / min_loss / max_loss default to the settings at the top of the file."""
+    adaptive = tp_frac is None                    # None = trend-based take profit (live scans); a number = fixed (sweep)
     tp_frac = TP_FRAC if tp_frac is None else tp_frac
     sl_frac = SL_MOVE_FRAC if sl_frac is None else sl_frac
     min_loss = MIN_LOSS if min_loss is None else min_loss
@@ -778,7 +786,19 @@ def trade_plan(opt, a, tp_frac=None, sl_frac=None, min_loss=None, max_loss=None)
     T_exit = max(T - HOLD_HOURS / (24 * 365), 1.0 / (24 * 365))
 
     now_px = bs_price(S, K, T, iv, side)
-    stock_tp = S + sign * a["move"] * tp_frac
+    note = ""
+    if adaptive:
+        strong = abs(a.get("score", 0)) >= STRONG_SCORE
+        frac = TP_FRAC_STRONG if strong else TP_FRAC_MOD
+        tp_dist = a["move"] * frac
+        note = f"{'strong' if strong else 'moderate'} trend, target {frac:.0%} of the expected day move"
+        room = (a.get("pa") or {}).get("room_up" if sign > 0 else "room_dn")
+        if room is not None and room * ROOM_BUFFER < tp_dist:
+            tp_dist = room * ROOM_BUFFER
+            note = f"target kept just short of the next {'resistance' if sign > 0 else 'support'} ({room:.2f} away)"
+        stock_tp = S + sign * tp_dist
+    else:
+        stock_tp = S + sign * a["move"] * tp_frac
     stock_sl = S - sign * a["move"] * sl_frac
     ref = a.get("sl_ref")
     if ref is not None:                                   # structural stop, kept within a sensible distance
@@ -792,11 +812,16 @@ def trade_plan(opt, a, tp_frac=None, sl_frac=None, min_loss=None, max_loss=None)
     if gain <= 0:
         return None
     loss = min(max(loss, entry * min_loss), entry * max_loss)
+    if adaptive and gain > loss * MAX_RR:
+        gain = loss * MAX_RR
+        note += f"; capped at {MAX_RR:g}x the risk"
 
     entry_r = round(entry, 2)
     tp = round(entry + gain, 2)
     sl = round(entry - loss, 2)
+    rr_now = (tp - entry_r) / max(entry_r - sl, 1e-9)
     return dict(entry=entry_r, sl=sl, tp=tp,
+                tp1=round(entry_r + (entry_r - sl), 2), tp_note=note or "fixed target", be_win=round(100 / (1 + rr_now), 0),
                 profit_1lot=round((tp - entry_r) * CONTRACT_SIZE, 2),
                 loss_1lot=round((entry_r - sl) * CONTRACT_SIZE, 2),
                 cost_1lot=round(entry_r * CONTRACT_SIZE, 2),
@@ -1260,7 +1285,7 @@ def run_backtest(data, days=20, iv_mult=BT_IV_MULT, slip=BT_SLIPPAGE, commission
                  prep=None, params=None, variants=None):
     """One row per trade. params (all optional) override tp_frac, sl_frac, min_loss, max_loss, min_score, min_rr,
     require_pa, min_rvol. variants = {name: use_price_action}; default compares with / without price action."""
-    p = dict(tp_frac=TP_FRAC, sl_frac=SL_MOVE_FRAC, min_loss=MIN_LOSS, max_loss=MAX_LOSS,
+    p = dict(tp_frac=None, sl_frac=SL_MOVE_FRAC, min_loss=MIN_LOSS, max_loss=MAX_LOSS,
              min_score=MIN_SCORE, min_rr=MIN_RR, require_pa=REQUIRE_PA, min_rvol=MIN_RVOL, random_dir=None)
     p.update(params or {})
     variants = variants or {"Price action": True, "Indicators only": False}
@@ -1432,6 +1457,7 @@ def telegram_text(res):
         lines += [
             f"{star}{'🟢' if side == 'CALL' else '🔴'} {side} {o['symbol']} {o['strike']:g} exp {o['expiry']}",
             f"Entry {p['entry']} | SL {p['sl']} | TP {p['tp']} (+${p['profit_1lot']:.0f}/lot)",
+            f"R:R {p['rr']} ({p['tp_note']}) | safer: half off at {p['tp1']}, then SL to entry",
             f"Δ{o['delta']:.2f} Γ{o['gamma']:.3f} Θ{o['theta']:.2f} V{o['vega']:.2f} ρ{o['rho']:.2f} IV{o['iv'] * 100:.0f}%",
             f"Stock {a['spot']:.2f} → day est {a['pred_close']:.2f} (H {a['pred_high']:.2f} / L {a['pred_low']:.2f})",
         ]
@@ -1823,6 +1849,8 @@ def ticket_png(item, title=None):
         txt(pad, y + 8, f"{o['symbol']} {a['spot']:.2f} | strike {o['strike']:g} {o['side']} | exp {o['expiry']} ({o['dte']}d)", f_s, _MUT)
         y += 22
         txt(pad, y + 8, f"Delta {o['delta']:.2f} | IV {o['iv'] * 100:.0f}% | R:R {p['rr']} | day est {a['pred_close']:.2f}", f_s, _MUT)
+        y += 22
+        txt(pad, y + 8, f"R:R {p['rr']} | safer: sell half at {p['tp1']:.2f}, then move SL to entry", f_s, _MUT)
         y += 30
         img = img.crop((0, 0, W * S, y * S))
         buf = io.BytesIO()
@@ -1996,6 +2024,8 @@ def draw_box(item, side, is_top, ns=""):
         m[1].metric("Take profit", f"{p['tp']:.2f}", f"+${p['profit_1lot']:,.0f}")
         m[2].metric("Stop loss", f"{p['sl']:.2f}", f"-${p['loss_1lot']:,.0f}")
         m[3].metric("Reward:Risk", f"{p['rr']}")
+        st.caption(f"**Why this R:R:** {p['tp_note']}. Needs only {p['be_win']:.0f}% winners to break even. "
+                   f"Safer: sell half at {p['tp1']:.2f} (1x risk), then move the stop to {p['entry']:.2f}.")
         st.caption(f"Δ{o['delta']:.2f} Γ{o['gamma']:.3f} Θ{o['theta']:.2f} V{o['vega']:.2f} ρ{o['rho']:.2f} · "
                    f"IV {o['iv'] * 100:.0f}% · Bid/Ask {o['bid']:.2f}/{o['ask']:.2f} ({o['spread']:.1f}%) · "
                    f"Vol/OI {o['vol']}/{o['oi']}")
