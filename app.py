@@ -52,6 +52,83 @@ import pandas as pd
 import yfinance as yf
 import requests
 import streamlit as st
+import threading
+
+# ----------------------------- cTrader (Pepperstone) PRICE FEED -----------------------------
+# The cBot PriceFeedExporter (run inside cTrader) writes <SYMBOL>_M5.csv / _D1.csv / _quote.txt into this folder.
+# Commodities are read from there so prices and calls match your Pepperstone / cTrader screen.
+CT_FEED_DIR = os.getenv("CTRADER_FEED_DIR") or os.path.join(os.path.expanduser("~"), "Documents", "cTraderFeed")
+CT_MAX_AGE_SEC = 180                          # files older than this = cTrader / the cBot is not running
+# scanner commodity name -> cTrader symbol names to try, in order (edit to match your cTrader symbol list)
+CT_SYMBOLS = {
+    "Coffee": ["Coffee", "CoffeeC"],
+    "Gold": ["XAUUSD"],
+    "Silver": ["XAGUSD"],
+    "Natural gas": ["NatGas", "NGAS", "XNGUSD"],
+    "Spot crude (WTI)": ["SpotCrude", "USOIL", "XTIUSD"],
+    "Copper": ["Copper", "XCUUSD"],
+    "Nickel": ["Nickel"],
+}
+
+
+def _ct_path(sym, kind):
+    return os.path.join(CT_FEED_DIR, f"{sym}_{kind}")
+
+
+def _ct_fresh(path):
+    try:
+        return (time.time() - os.path.getmtime(path)) <= CT_MAX_AGE_SEC
+    except OSError:
+        return False
+
+
+def _ct_read(path):
+    df = pd.read_csv(path)
+    if df is None or df.empty:
+        return None
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df = df.set_index("time").sort_index()
+    return df[["open", "high", "low", "close", "volume"]].astype(float)
+
+
+def ct_find(name):
+    for sym in CT_SYMBOLS.get(name, [name]):
+        if _ct_fresh(_ct_path(sym, "M5.csv")) and _ct_fresh(_ct_path(sym, "D1.csv")):
+            return sym
+    return None
+
+
+def ctrader_bars(name):
+    """(5-minute bars UTC, daily bars, cTrader symbol) or None when the feed is not running."""
+    sym = ct_find(name)
+    if not sym:
+        return None
+    try:
+        df, dd = _ct_read(_ct_path(sym, "M5.csv")), _ct_read(_ct_path(sym, "D1.csv"))
+    except Exception:
+        return None
+    return (df, dd, sym) if df is not None and dd is not None else None
+
+
+def ctrader_quote(name):
+    """{price, chg, pct, sym}: bid/ask mid vs the previous daily close, straight from cTrader, or None."""
+    got = ctrader_bars(name)
+    if not got:
+        return None
+    df, dd, sym = got
+    price = None
+    try:
+        with open(_ct_path(sym, "quote.txt"), "r") as f:
+            bid, ask = f.read().strip().split(";")[:2]
+        price = (float(bid) + float(ask)) / 2
+    except Exception:
+        pass
+    if not price or price != price:
+        price = float(df["close"].iloc[-1])
+    if len(dd) < 2:
+        return None
+    prev = float(dd["close"].iloc[-2])
+    return dict(price=price, chg=price - prev, pct=(price / prev - 1) * 100, sym=sym) if prev else None
 
 # ----------------------------- SETTINGS -----------------------------
 ET = ZoneInfo("America/New_York")
@@ -169,6 +246,7 @@ COMMODITIES = [
     ("Nickel", ["NI=F"]),          # LME nickel has no reliable free Yahoo feed - shows "no data" if Yahoo has none
 ]
 COMM_FILE = "commodity_state.json"
+COMM_YAHOO_FALLBACK = False                  # False = prices and calls come ONLY from the cTrader feed
 COMM_TELEGRAM = True                         # send each hourly commodity update to Telegram (set False to mute)
 COMM_MIN_SCORE = 3                           # minimum |score| for a BUY / SELL (otherwise WAIT)
 COMM_MIN_RR = 1.2                            # below this reward:risk the call becomes WAIT
@@ -886,6 +964,17 @@ def comm_signal(df, dd, name, sym):
 
 
 def comm_fetch(name, cands):
+    ct = ctrader_bars(name)                                            # live Pepperstone prices from cTrader
+    if ct is not None:
+        try:
+            sig = comm_signal(_clean_24h(ct[0]), ct[1], name, ct[2])
+            if sig:
+                sig["source"] = "cTrader"
+                return sig
+        except Exception:
+            pass
+    if not COMM_YAHOO_FALLBACK:
+        return None
     for sym in cands:
         try:
             df = _clean_24h(yf.Ticker(sym).history(period="5d", interval="5m"))
@@ -1022,6 +1111,7 @@ def run_scheduled(cfg):
     except Exception as e:
         state[key] = {"error": str(e), "time": now.isoformat(timespec="seconds"), "mode": mode, "label": label}
         save_state(state)
+        send_telegram(cfg, f"⚠️ {label} scan failed: {e}")
     return key
 
 # ----------------------------- BACKTEST -----------------------------
@@ -1513,19 +1603,23 @@ def render_commodities(quotes):
             cols = st.columns(4)
             for c, (name, cands) in zip(cols, COMMODITIES[i:i + 4]):
                 s = sigs.get(name)
-                d = quotes.get(cands[0])
+                d = ctrader_quote(name)
+                src_lbl = d["sym"] if d else None
+                if not d and COMM_YAHOO_FALLBACK:
+                    d = quotes.get(cands[0])
                 with c:
                     with st.container(border=True):
                         st.markdown(f"**{name}**")
                         if d:
-                            st.metric(cands[0].replace("=F", " futures"), _pxf(d["price"]),
+                            st.metric(f"{src_lbl} (cTrader)" if src_lbl else cands[0].replace("=F", " futures"), _pxf(d["price"]),
                                       f"{d['chg']:+,.3f} ({d['pct']:+.2f}%)" if abs(d["price"]) < 10
                                       else f"{d['chg']:+,.2f} ({d['pct']:+.2f}%)")
                         else:
                             st.metric(cands[0], "n/a")
                         sig = (s or {}).get("signal", "N/A")
                         if sig == "N/A":
-                            st.warning("No data feed for this symbol")
+                            st.warning("No cTrader price - start the PriceFeedExporter cBot in cTrader" if not COMM_YAHOO_FALLBACK
+                                       else "No data feed for this symbol")
                         elif sig == "CLOSED":
                             st.warning("Market closed")
                         else:
@@ -1541,7 +1635,7 @@ def render_commodities(quotes):
                                            f"R:R {s['rr']:.1f}")
                             st.caption(f"1h range est {_pxf(s['spot'] - s['hr_move'])} - {_pxf(s['spot'] + s['hr_move'])} | "
                                        f"RSI {s['rsi']:.0f}")
-                            st.caption(" ".join(s["tags"]))
+                            st.caption(" ".join(s["tags"]) + f"  | feed: {s.get('source', 'Yahoo')}")
                             if s.get("stale"):
                                 t0 = dt.datetime.fromisoformat(s["time"])
                                 st.caption(f"Market closed - last live call {t0.strftime('%a %H:%M')} ET")
@@ -1644,7 +1738,7 @@ def order_ticket_html(item):
     return html
 
 
-def draw_box(item, side, is_top, ns=""):
+def draw_box_full(item, side, is_top, ns=""):
     icon = "🟢" if side == "CALL" else "🔴"
     if not item:
         with st.container(border=True):
@@ -1709,6 +1803,49 @@ def draw_box(item, side, is_top, ns=""):
             option_chart(item)
 
 
+def draw_box(item, side, is_top, ns=""):
+    """Compact call / put card. Switch 'Compact call/put boxes' off in the sidebar for the full-size view."""
+    if not st.session_state.get("compact_view", True):
+        return draw_box_full(item, side, is_top, ns)
+    icon = "🟢" if side == "CALL" else "🔴"
+    if not item:
+        with st.container(border=True):
+            st.markdown(f"**{icon} {side}** - no qualifying contract this scan")
+            st.caption(f"Needs |score| >= {MIN_SCORE}, volume >= {MIN_RVOL}x, no earnings before expiry, delta "
+                       f"{DELTA_MIN}-{DELTA_MAX}, spread <= {MAX_SPREAD_PCT:g}%, OI >= {MIN_OI}, R:R >= {MIN_RR}. "
+                       "Waiting for a cleaner setup is intended.")
+        return
+    o, p, a = item["opt"], item["plan"], item["a"]
+    pa = a["pa"]
+    top_txt = "  ⭐ TOP PICK" if is_top else ""
+    strength = "STRONG" if item["strong"] else "moderate"
+    with st.container(border=True):
+        st.markdown(f"**{icon} {side} · {o['symbol']} {opt_code(o)}**{top_txt}  ·  exp {o['expiry']} ({o['dte']}d)"
+                    f"  ·  {strength} {a['score']:+d}")
+        m = st.columns(4)
+        m[0].metric("Entry", f"{p['entry']:.2f}")
+        m[1].metric("Take profit", f"{p['tp']:.2f}", f"+${p['profit_1lot']:,.0f}")
+        m[2].metric("Stop loss", f"{p['sl']:.2f}", f"-${p['loss_1lot']:,.0f}")
+        m[3].metric("Reward:Risk", f"{p['rr']}")
+        st.caption(f"Δ{o['delta']:.2f} Γ{o['gamma']:.3f} Θ{o['theta']:.2f} V{o['vega']:.2f} ρ{o['rho']:.2f} · "
+                   f"IV {o['iv'] * 100:.0f}% · Bid/Ask {o['bid']:.2f}/{o['ask']:.2f} ({o['spread']:.1f}%) · "
+                   f"Vol/OI {o['vol']}/{o['oi']}")
+        st.caption(f"Stock {a['spot']:.2f} → day est {a['pred_close']:.2f} (H {a['pred_high']:.2f} / L {a['pred_low']:.2f}) · "
+                   f"RSI {a['rsi']:.0f} · RVOL {a['rvol']:.1f}x · {pa['struct']} · {' '.join(a['tags'])}"
+                   f"{' · BLOCKED (level too close)' if 'PA:blocked' in a['tags'] else ''}")
+        if not o["market_open"]:
+            st.caption("Option quotes not live - last price used. Confirm bid/ask before entry.")
+        with st.expander("Order ticket and option chart"):
+            link = tv_option_url(o)
+            try:
+                st.link_button(f"📈 {o['symbol']} {opt_code(o)} on TradingView (OPRA)", link)
+            except AttributeError:
+                st.markdown(f"[📈 {o['symbol']} {opt_code(o)} on TradingView (OPRA)]({link})")
+            st.markdown(order_ticket_html(item), unsafe_allow_html=True)
+            if st.toggle("Load option chart", value=False, key=f"oc_{ns}_{side}_{o['contract']}"):
+                option_chart(item)
+
+
 def render_scan(res, empty_msg, ns=""):
     if not res:
         st.info(empty_msg)
@@ -1724,8 +1861,15 @@ def render_scan(res, empty_msg, ns=""):
     st.write(f"Scan time: **{when.strftime('%a %d %b %H:%M')} ET** ({fmt_local(when)} your time) | "
              f"{res.get('scanned', '?')}/{len(SYMBOLS)} stocks read | "
              f"{MARKET_SYM} market bias: **{_bias_txt(res.get('market', 0))}**{tg}")
-    draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL", f"{ns}{res['time']}")
-    draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT", f"{ns}{res['time']}")
+    if st.session_state.get("compact_view", True):
+        col_c, col_p = st.columns(2)
+        with col_c:
+            draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL", f"{ns}{res['time']}")
+        with col_p:
+            draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT", f"{ns}{res['time']}")
+    else:
+        draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL", f"{ns}{res['time']}")
+        draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT", f"{ns}{res['time']}")
     with st.expander("All stocks - direction score & day estimate"):
         if res.get("table"):
             st.dataframe(pd.DataFrame(res["table"]).sort_values("score", key=abs, ascending=False))
@@ -1903,6 +2047,99 @@ def cli_backtest(days):
         print(_breakdown(g, "scan").to_string())
     print(f"\nTrades saved to {BT_FILE}")
 
+# ----------------------------- BACKGROUND SERVICE -----------------------------
+# python us_itm_scanner.py --daemon   runs every scheduled scan + the hourly commodity calls and sends Telegram,
+# with no browser page needed. The Streamlit page then only DISPLAYS what the service found (and still has manual scans).
+HEARTBEAT_FILE = "daemon_heartbeat.json"
+DAEMON_LOG = "daemon.log"
+DAEMON_POLL_SEC = 15
+
+
+def _dlog(msg):
+    line = f"{dt.datetime.now(ET):%Y-%m-%d %H:%M:%S} ET  {msg}"
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+    try:
+        with open(DAEMON_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def daemon_alive(max_age=60):
+    hb = _load_json(HEARTBEAT_FILE)
+    try:
+        return (time.time() - float(hb.get("ts", 0))) <= max_age
+    except Exception:
+        return False
+
+
+def _heartbeat_loop(stop):
+    while not stop.is_set():
+        try:
+            _save_json(HEARTBEAT_FILE, {"ts": time.time(), "pid": os.getpid(),
+                                        "time": dt.datetime.now(ET).isoformat(timespec="seconds")})
+        except Exception:
+            pass
+        stop.wait(10)
+
+
+def run_daemon():
+    if daemon_alive():
+        print("The background service is already running (heartbeat is fresh). Exiting.")
+        return
+    stop = threading.Event()
+    threading.Thread(target=_heartbeat_loop, args=(stop,), daemon=True).start()
+    cfg = load_config()
+    _dlog("Background scanner started")
+    send_telegram(cfg, "✅ Scanner background service started - scans 09:45 ET + hourly to 14:45 ET, commodities hourly.")
+    try:
+        while True:
+            cfg = load_config()                      # picks up a changed Telegram token without a restart
+            try:
+                key = run_scheduled(cfg)
+                if key:
+                    _dlog(f"scan '{key}' finished")
+                if run_commodities(cfg):
+                    _dlog("commodity update done")
+            except Exception as e:
+                _dlog(f"error: {e}")
+            time.sleep(DAEMON_POLL_SEC)
+    except KeyboardInterrupt:
+        _dlog("Stopped by user")
+    finally:
+        stop.set()
+
+
+def _state_sig():
+    sig = []
+    for f in (STATE_FILE, COMM_FILE):
+        try:
+            sig.append(os.path.getmtime(f))
+        except OSError:
+            sig.append(0)
+    return tuple(sig)
+
+
+def viewer_loop(mkt_box):
+    """Page is only a viewer (the background service does the scans): refresh when it writes new results."""
+    sig0, last = _state_sig(), time.time()
+    box = st.empty()
+    while True:
+        time.sleep(3)
+        if _state_sig() != sig0:
+            st.rerun()
+        if time.time() - last >= MARKET_REFRESH_SEC:
+            render_market(mkt_box)
+            last = time.time()
+        nxt, when = next_scan(dt.datetime.now(ET))
+        if when:
+            box.caption(f"Background service is running. Next scan: **{nxt[4]}** at {when.strftime('%a %H:%M')} ET "
+                        f"({fmt_local(when)} your time). This page updates by itself.")
+
+
 # ----------------------------- STREAMLIT UI -----------------------------
 
 def main():
@@ -1914,7 +2151,11 @@ def main():
                "day) - all Greeks + price action + market filter - educational only, not advice.")
 
     with st.sidebar:
-        auto = st.toggle("Auto scans (see schedule)", value=True)
+        alive = daemon_alive()
+        auto = st.toggle("Auto scans in this page (turn OFF when the background service runs)", value=not alive)
+        st.toggle("Compact call/put boxes", value=True, key="compact_view")
+        if alive:
+            st.success("Background service is running ✅ (scans + Telegram)")
         with st.expander("Telegram"):
             bot = st.text_input("Bot token", value=cfg.get("telegram_bot_token", ""), type="password")
             chat = st.text_input("Chat ID", value=cfg.get("telegram_chat_id", ""))
@@ -1925,12 +2166,15 @@ def main():
                 st.success("Saved")
             if b2.button("Test"):
                 st.success("Sent") if send_telegram(cfg, "✅ Scanner test message") else st.error("Not sent")
-        st.markdown("**Manual run** (screen only, no Telegram)")
-        run_pre = st.button("Premarket scan now")
-        run_open = st.button("Open-style scan now")
-        run_hourly = st.button("Hourly-style scan now")
+        st.caption("Manual scans: use the buttons at the top of the page.")
 
     # indices box + top 10 shares first, so they show while a scan is running
+    top = st.container()                         # call / put section lives here, ABOVE the indices box
+    bc = top.columns([1, 1, 1, 1.4])
+    run_pre = bc[0].button("▶ Premarket scan now")
+    run_open = bc[1].button("▶ Open-style scan now")
+    run_hourly = bc[2].button("▶ Hourly-style scan now")
+    tg_manual = bc[3].checkbox("Send manual scan to Telegram", value=True)
     mkt_box = st.empty()
     render_market(mkt_box)
     if run_commodities(cfg):                     # hourly commodity calls (own schedule, own file)
@@ -1945,6 +2189,8 @@ def main():
         if flag:
             with st.spinner(f"Scanning {len(SYMBOLS)} stocks..."):
                 manual[mode] = scan_once(mode, pre_scores_today(load_state()) if mode != "pre" else None, label)
+                if tg_manual:
+                    manual[mode]["telegram"] = send_telegram(cfg, telegram_text(manual[mode]))
 
     state = load_state()
     now = dt.datetime.now(ET)
@@ -1967,13 +2213,13 @@ def main():
             marks.append(f"✅ {start:%H:%M}")
         else:
             marks.append(f"⏳ {start:%H:%M}")
-    st.caption("Today (ET): " + "  ".join(marks))
+    top.caption("Today (ET): " + "  ".join(marks))
 
     def newest(key, mode):
         a, b = scheduled.get(key), manual.get(mode)
         return max([x for x in (a, b) if ok(x)], key=when_of) if (ok(a) or ok(b)) else (state.get(key) or None)
 
-    t_latest, t_open, t_hour, t_bt = st.tabs(["Latest scan", "Open 09:45", "Hourly scans", "Backtest"])
+    t_latest, t_open, t_hour, t_bt = top.tabs(["Latest scan", "Open 09:45", "Hourly scans", "Backtest"])
     with t_latest:
         render_scan(latest, "No scan yet - the first one runs at 09:45 ET (or use a manual run).", "latest")
     with t_open:
@@ -1989,6 +2235,8 @@ def main():
     with t_bt:
         render_backtest_tab()
 
+    if not auto and daemon_alive():
+        viewer_loop(mkt_box)
     if auto:
         box = st.empty()
         last_mkt = time.time()
@@ -2011,7 +2259,9 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--sweep" in sys.argv:
+    if "--daemon" in sys.argv:
+        run_daemon()
+    elif "--sweep" in sys.argv:
         i = sys.argv.index("--sweep")
         cli_sweep(int(sys.argv[i + 1]) if len(sys.argv) > i + 1 and sys.argv[i + 1].isdigit() else 40)
     elif "--backtest" in sys.argv:
