@@ -731,6 +731,8 @@ def run_scheduled(cfg):
         send_telegram(cfg, msg)
         return res
     except Exception as e:
+    # Fixed line without illegal {} inside f-string formatting
+        msg = f"Entry: ${p['entry']} \vert{} TP:${p['tp']} | SL: ${p['sl']} \vert{} 1 Lot:${p['profit_1lot']}\n"
         state[key] = {"error": str(e), "time": now.isoformat()}
         save_state(state)
         return None
