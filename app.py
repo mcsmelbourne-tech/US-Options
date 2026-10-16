@@ -126,7 +126,7 @@ SYMBOLS = [
     "SO", "T", "LMT", "TMUS", "REGN",
     "DE", "EOG", "MMC", "ITW", "UPS",
     "PGR", "MDLZ", "CL", "BDX", "NKE",
-    "SHW", "USB", "PNC", "ADI", "DUK"
+    "SHW", "USB", "PNC", "DUK"
 ]
 
 # ----------------------------- CONFIG / STATE / TELEGRAM -----------------------------
