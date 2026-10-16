@@ -1,5 +1,5 @@
 """
-US Top-50 Call/Put Scanner - scheduled scans every US trading day (yfinance + Greeks + price action)
+US Top-100 Call/Put Scanner - scheduled scans every US trading day (yfinance + Greeks + price action)
 
   Scan 1  PREMARKET    09:00 ET - gap, premarket range/volume, trend; option prices are indicative
   Scan 2  OPEN +10min  09:40 ET - re-scores everything, ADDS the premarket scan result
@@ -80,7 +80,7 @@ CONTRACT_SIZE = 100                          # 1 lot = 1 contract = 100 shares
 
 MIN_SCORE = 3                                # minimum |score| to be considered
 STRONG_SCORE = 5                             # |score| for a "strong" signal
-CANDIDATES = 12                              # stocks (best scores) whose option chains are checked
+CANDIDATES = 15                              # stocks (best scores) whose option chains are checked
 
 # option filters / ranking
 TARGET_DELTA = 0.65
@@ -90,7 +90,7 @@ MIN_OI = 100
 
 # trade plan (stock based, converted to option prices with the Greeks / Black-Scholes)
 HOLD_HOURS = 6.0                             # time decay assumed before exit
-TP_FRAC = 1.0                                # stock target = this x the expected move (smaller = closer target, higher win rate)
+TP_FRAC = 1.0                                # stock target = this x the expected move
 SL_MOVE_FRAC = 0.5                           # stock stop = 50% of the expected move against the trade
 MIN_LOSS, MAX_LOSS = 0.10, 0.30              # option stop loss clamped to 10-30% of premium
 MIN_RR = 1.3                                 # skip trades with reward:risk below this
@@ -106,6 +106,7 @@ BT_SLIPPAGE = 0.02                           # 2% of premium lost on entry and o
 BT_COMMISSION = 0.65                         # $ per contract per side
 
 SYMBOLS = [
+    # Top 100 US Stocks
     "AAPL", "MSFT", "GOOGL", "AMZN", "META",
     "NVDA", "TSLA", "BRK-B", "UNH", "JNJ",
     "V", "PG", "JPM", "HD", "MA",
@@ -116,6 +117,16 @@ SYMBOLS = [
     "ABT", "WFC", "DIS", "DHR", "TXN",
     "QCOM", "AMD", "INTC", "IBM", "GS",
     "CAT", "AMGN", "HON", "UNP", "LOW",
+    "INTU", "SPGI", "AMAT", "BKNG", "ISRG",
+    "GE", "GILD", "VRTX", "C", "MDT",
+    "SBUX", "BLK", "LRCX", "NOW", "SCHW",
+    "COP", "TJX", "BA", "ZTS", "PLD",
+    "CB", "MO", "PANW", "MU", "SNPS",
+    "CI", "SLB", "HUM", "BSX", "ADI",
+    "SO", "T", "LMT", "TMUS", "REGN",
+    "DE", "EOG", "MMC", "ITW", "UPS",
+    "PGR", "MDLZ", "CL", "BDX", "NKE",
+    "SHW", "USB", "PNC", "ADI", "DUK"
 ]
 
 # ----------------------------- CONFIG / STATE / TELEGRAM -----------------------------
@@ -617,7 +628,7 @@ def log_picks(res):
 
 def scan_once(mode, pre_prev=None, label=None):
     now = dt.datetime.now(ET)
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         analysed = [a for a in ex.map(lambda s: analyse(s, mode, pre_prev), SYMBOLS) if a]
 
     table = [dict(symbol=a["sym"], price=round(a["spot"], 2), gap_pct=round(a["gap"], 2), rsi=round(a["rsi"], 1),
@@ -638,7 +649,7 @@ def scan_once(mode, pre_prev=None, label=None):
         rank = abs(a["score"]) * 10 + opt["quality"] * 0.25 + min(plan["rr"], 3.0) * 5
         return dict(side=side, a=a, opt=opt, plan=plan, rank=rank, strong=abs(a["score"]) >= STRONG_SCORE)
 
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         built = [b for b in ex.map(build, cands) if b]
 
     res = {"mode": mode, "label": label or {"pre": "Premarket", "open": "Open +10min", "hourly": "Hourly"}[mode],
@@ -728,7 +739,7 @@ def run_scheduled(cfg):
 
 def main():
     st.set_page_config(page_title="US ITM Scanner", layout="wide")
-    st.title("US Top-50 Call/Put Scanner")
+    st.title("US Top-100 Call/Put Scanner")
     
     cfg = load_config()
     
@@ -738,12 +749,12 @@ def main():
     tab1, tab2, tab3 = st.tabs(["Scanner Dashboard", "Backtest", "Settings"])
 
     with tab1:
-        st.subheader("Live & Scheduled Scans")
+        st.subheader("Live & Scheduled Scans (Top-100)")
         state = load_state()
         today = str(dt.datetime.now(ET).date())
         
         if st.button("Run Manual Scan Now (Open +10min)"):
-            with st.spinner("Running scan..."):
+            with st.spinner("Running scan across 100 stocks..."):
                 pre_scores = pre_scores_today(state)
                 res = scan_once("open", pre_scores, "Manual Open")
                 if state.get("date") != today:
@@ -761,7 +772,7 @@ def main():
         
         if latest_key and state.get(latest_key):
             data = state[latest_key]
-            st.info(f"Showing results from: **{data.get('label')}** ({data.get('time')})")
+            st.info(f"Showing results from: **{data.get('label')}** ({data.get('time')}) | Scanned stocks: {data.get('scanned', 100)}")
             
             col1, col2 = st.columns(2)
             with col1:
