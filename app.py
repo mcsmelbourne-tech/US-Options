@@ -2,7 +2,7 @@
 US Top-100 Call/Put Scanner - scheduled scans every US trading day (yfinance + Greeks + price action)
 
   Scan 1  OPEN 09:45 ET   - first scan of the day (premarket range/gap/volume + the first 15 min of trading)
-  Scan 2+ EVERY 30 MIN    10:15, 10:45, 11:15 ... 14:15, 14:45 ET - fresh picks through the day (volume is judged
+  Scan 2+ HOURLY          10:45, 11:45, 12:45, 13:45, 14:45 ET - fresh picks through the day (volume is judged
                           against the time of day; 14:45 is the last, trades exit by 15:45 ET)
 
 Top of the page: US INDICES box (S&P 500, Dow, Nasdaq, Nasdaq 100, Russell 2000, ... + SPY, QQQ, DIA, IWM)
@@ -52,85 +52,6 @@ import pandas as pd
 import yfinance as yf
 import requests
 import streamlit as st
-import threading
-
-# ----------------------------- cTrader (Pepperstone) PRICE FEED -----------------------------
-# The cBot PriceFeedExporter (run inside cTrader) writes <SYMBOL>_M5.csv / _D1.csv / _quote.txt into this folder.
-# Commodities are read from there so prices and calls match your Pepperstone / cTrader screen.
-CT_FEED_DIR = os.getenv("CTRADER_FEED_DIR") or os.path.join(os.path.expanduser("~"), "Documents", "cTraderFeed")
-CT_MAX_AGE_SEC = 180                          # files older than this = cTrader / the cBot is not running
-# scanner commodity name -> cTrader symbol names to try, in order (edit to match your cTrader symbol list)
-CT_SYMBOLS = {
-    "Coffee": ["Coffee", "CoffeeC"],
-    "Gold": ["XAUUSD"],
-    "Silver": ["XAGUSD"],
-    "Natural gas": ["NatGas", "NGAS", "XNGUSD"],
-    "Spot crude (WTI)": ["SpotCrude", "USOIL", "XTIUSD"],
-    "Copper": ["Copper", "XCUUSD"],
-    "Nickel": ["Nickel"],
-}
-
-
-def _ct_path(sym, kind):
-    return os.path.join(CT_FEED_DIR, f"{sym}_{kind}")
-
-
-def _ct_fresh(path):
-    try:
-        return (time.time() - os.path.getmtime(path)) <= CT_MAX_AGE_SEC
-    except OSError:
-        return False
-
-
-def _ct_read(path):
-    df = pd.read_csv(path)
-    if df is None or df.empty:
-        return None
-    df["time"] = pd.to_datetime(df["time"], utc=True)
-    df = df.set_index("time").sort_index()
-    return df[["open", "high", "low", "close", "volume"]].astype(float)
-
-
-def ct_find(name):
-    for sym in CT_SYMBOLS.get(name, [name]):
-        if _ct_fresh(_ct_path(sym, "M5.csv")) and _ct_fresh(_ct_path(sym, "D1.csv")):
-            return sym
-    return None
-
-
-def ctrader_bars(name):
-    """(5-minute bars UTC, daily bars, cTrader symbol) or None when the feed is not running."""
-    if not COMM_USE_CTRADER:
-        return None
-    sym = ct_find(name)
-    if not sym:
-        return None
-    try:
-        df, dd = _ct_read(_ct_path(sym, "M5.csv")), _ct_read(_ct_path(sym, "D1.csv"))
-    except Exception:
-        return None
-    return (df, dd, sym) if df is not None and dd is not None else None
-
-
-def ctrader_quote(name):
-    """{price, chg, pct, sym}: bid/ask mid vs the previous daily close, straight from cTrader, or None."""
-    got = ctrader_bars(name)
-    if not got:
-        return None
-    df, dd, sym = got
-    price = None
-    try:
-        with open(_ct_path(sym, "quote.txt"), "r") as f:
-            bid, ask = f.read().strip().split(";")[:2]
-        price = (float(bid) + float(ask)) / 2
-    except Exception:
-        pass
-    if not price or price != price:
-        price = float(df["close"].iloc[-1])
-    if len(dd) < 2:
-        return None
-    prev = float(dd["close"].iloc[-2])
-    return dict(price=price, chg=price - prev, pct=(price / prev - 1) * 100, sym=sym) if prev else None
 
 # ----------------------------- SETTINGS -----------------------------
 ET = ZoneInfo("America/New_York")
@@ -148,7 +69,7 @@ SCAN_OPEN_LATEST = dt.time(10, 30)           # if the app starts late, still run
 MARKET_OPEN = dt.time(9, 30)
 MARKET_CLOSE = dt.time(16, 0)
 EXIT_TIME = dt.time(15, 45)                  # trades are closed by this time
-HOURLY_TIMES = [dt.time(h, m) for h in range(10, 15) for m in (15, 45)]   # 10:15, 10:45 ... 14:15, 14:45 ET - every 30 minutes after the first scan
+HOURLY_TIMES = [dt.time(h, 45) for h in range(10, 15)]   # 10:45 ... 14:45 ET, every hour after the first scan
 HOURLY_GRACE_MIN = 20                                    # a late start can still run an hourly scan this long after its time
 
 
@@ -159,7 +80,7 @@ def _plus(t, minutes):
 # (key, mode, start time ET, latest start ET, label) - in time order
 SCHEDULE = (
     [("open", "open", SCAN_OPEN_TIME, SCAN_OPEN_LATEST, "Open 09:45")]
-    + [(f"h{t:%H%M}", "hourly", t, _plus(t, HOURLY_GRACE_MIN), f"Scan {t:%H:%M}") for t in HOURLY_TIMES]
+    + [(f"h{t:%H%M}", "hourly", t, _plus(t, HOURLY_GRACE_MIN), f"Hourly {t:%H:%M}") for t in HOURLY_TIMES]
 )
 
 RISK_FREE = 0.04
@@ -186,14 +107,7 @@ HOLD_HOURS = 6.0                             # time decay assumed before exit
 TP_FRAC = 1.0                                # stock target = this x the expected move (smaller = closer target, higher win rate)
 SL_MOVE_FRAC = 0.5                           # stock stop = 50% of the expected move against the trade
 MIN_LOSS, MAX_LOSS = 0.10, 0.30              # option stop loss clamped to 10-30% of premium
-MIN_RR = 1.5                                 # skip trades with reward:risk below this (was 1.3 - safer)
-# take profit is set from the trend, not a fixed number: STRONG trend = target at 80% of the expected day move,
-# moderate = 60%; it always stops SHORT of the next support / resistance, and the reward is capped at MAX_RR x the risk
-# (a very distant target is a low-probability one). Safer = closer targets that actually get hit.
-TP_FRAC_STRONG = 0.8
-TP_FRAC_MOD = 0.6
-ROOM_BUFFER = 0.9                            # target = at most 90% of the distance to the next support / resistance
-MAX_RR = 2.5
+MIN_RR = 1.3                                 # skip trades with reward:risk below this
 REQUIRE_PA = False                           # True = only trade when price action points the same way as the trade
 # TP_FRAC / SL_MOVE_FRAC / MAX_LOSS / MIN_SCORE / MIN_RR / REQUIRE_PA are what the Backtest tab's "Sweep" tunes -
 # copy the values it finds here (live scans and the backtest both read these).
@@ -255,8 +169,6 @@ COMMODITIES = [
     ("Nickel", ["NI=F"]),          # LME nickel has no reliable free Yahoo feed - shows "no data" if Yahoo has none
 ]
 COMM_FILE = "commodity_state.json"
-COMM_USE_CTRADER = False                     # True = use the cTrader price files (PriceFeedExporter cBot) when they are fresh
-COMM_YAHOO_FALLBACK = True                   # True = Yahoo Finance prices and calls (used whenever cTrader is off / not running)
 COMM_TELEGRAM = True                         # send each hourly commodity update to Telegram (set False to mute)
 COMM_MIN_SCORE = 3                           # minimum |score| for a BUY / SELL (otherwise WAIT)
 COMM_MIN_RR = 1.2                            # below this reward:risk the call becomes WAIT
@@ -775,7 +687,6 @@ def trade_plan(opt, a, tp_frac=None, sl_frac=None, min_loss=None, max_loss=None)
     """Stock targets from the day prediction, converted to option prices with Black-Scholes.
        With price action on, the stock stop goes just beyond the last swing low (call) / swing high (put).
        tp_frac / sl_frac / min_loss / max_loss default to the settings at the top of the file."""
-    adaptive = tp_frac is None                    # None = trend-based take profit (live scans); a number = fixed (sweep)
     tp_frac = TP_FRAC if tp_frac is None else tp_frac
     sl_frac = SL_MOVE_FRAC if sl_frac is None else sl_frac
     min_loss = MIN_LOSS if min_loss is None else min_loss
@@ -786,19 +697,7 @@ def trade_plan(opt, a, tp_frac=None, sl_frac=None, min_loss=None, max_loss=None)
     T_exit = max(T - HOLD_HOURS / (24 * 365), 1.0 / (24 * 365))
 
     now_px = bs_price(S, K, T, iv, side)
-    note = ""
-    if adaptive:
-        strong = abs(a.get("score", 0)) >= STRONG_SCORE
-        frac = TP_FRAC_STRONG if strong else TP_FRAC_MOD
-        tp_dist = a["move"] * frac
-        note = f"{'strong' if strong else 'moderate'} trend, target {frac:.0%} of the expected day move"
-        room = (a.get("pa") or {}).get("room_up" if sign > 0 else "room_dn")
-        if room is not None and room * ROOM_BUFFER < tp_dist:
-            tp_dist = room * ROOM_BUFFER
-            note = f"target kept just short of the next {'resistance' if sign > 0 else 'support'} ({room:.2f} away)"
-        stock_tp = S + sign * tp_dist
-    else:
-        stock_tp = S + sign * a["move"] * tp_frac
+    stock_tp = S + sign * a["move"] * tp_frac
     stock_sl = S - sign * a["move"] * sl_frac
     ref = a.get("sl_ref")
     if ref is not None:                                   # structural stop, kept within a sensible distance
@@ -812,16 +711,11 @@ def trade_plan(opt, a, tp_frac=None, sl_frac=None, min_loss=None, max_loss=None)
     if gain <= 0:
         return None
     loss = min(max(loss, entry * min_loss), entry * max_loss)
-    if adaptive and gain > loss * MAX_RR:
-        gain = loss * MAX_RR
-        note += f"; capped at {MAX_RR:g}x the risk"
 
     entry_r = round(entry, 2)
     tp = round(entry + gain, 2)
     sl = round(entry - loss, 2)
-    rr_now = (tp - entry_r) / max(entry_r - sl, 1e-9)
     return dict(entry=entry_r, sl=sl, tp=tp,
-                tp1=round(entry_r + (entry_r - sl), 2), tp_note=note or "fixed target", be_win=round(100 / (1 + rr_now), 0),
                 profit_1lot=round((tp - entry_r) * CONTRACT_SIZE, 2),
                 loss_1lot=round((entry_r - sl) * CONTRACT_SIZE, 2),
                 cost_1lot=round(entry_r * CONTRACT_SIZE, 2),
@@ -881,7 +775,7 @@ def scan_once(mode, pre_prev=None, label=None):
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         built = [b for b in ex.map(build, cands) if b]
 
-    res = {"mode": mode, "label": label or {"pre": "Premarket", "open": "Open 09:45", "hourly": "30-min scan"}[mode],
+    res = {"mode": mode, "label": label or {"pre": "Premarket", "open": "Open 09:45", "hourly": "Hourly"}[mode],
            "time": now.isoformat(timespec="seconds"), "CALL": None, "PUT": None, "top": None, "market": mkt,
            "table": table, "scores": {a["sym"]: a["score"] for a in analysed}, "scanned": len(analysed)}
     for b in built:
@@ -992,17 +886,6 @@ def comm_signal(df, dd, name, sym):
 
 
 def comm_fetch(name, cands):
-    ct = ctrader_bars(name)                                            # live Pepperstone prices from cTrader
-    if ct is not None:
-        try:
-            sig = comm_signal(_clean_24h(ct[0]), ct[1], name, ct[2])
-            if sig:
-                sig["source"] = "cTrader"
-                return sig
-        except Exception:
-            pass
-    if not COMM_YAHOO_FALLBACK:
-        return None
     for sym in cands:
         try:
             df = _clean_24h(yf.Ticker(sym).history(period="5d", interval="5m"))
@@ -1134,13 +1017,11 @@ def run_scheduled(cfg):
         state[key] = res
         save_state(state)
         res["telegram"] = send_telegram(cfg, telegram_text(res))
-        send_tickets(cfg, res)
         state[key] = res
         save_state(state)
     except Exception as e:
         state[key] = {"error": str(e), "time": now.isoformat(timespec="seconds"), "mode": mode, "label": label}
         save_state(state)
-        send_telegram(cfg, f"⚠️ {label} scan failed: {e}")
     return key
 
 # ----------------------------- BACKTEST -----------------------------
@@ -1285,7 +1166,7 @@ def run_backtest(data, days=20, iv_mult=BT_IV_MULT, slip=BT_SLIPPAGE, commission
                  prep=None, params=None, variants=None):
     """One row per trade. params (all optional) override tp_frac, sl_frac, min_loss, max_loss, min_score, min_rr,
     require_pa, min_rvol. variants = {name: use_price_action}; default compares with / without price action."""
-    p = dict(tp_frac=None, sl_frac=SL_MOVE_FRAC, min_loss=MIN_LOSS, max_loss=MAX_LOSS,
+    p = dict(tp_frac=TP_FRAC, sl_frac=SL_MOVE_FRAC, min_loss=MIN_LOSS, max_loss=MAX_LOSS,
              min_score=MIN_SCORE, min_rr=MIN_RR, require_pa=REQUIRE_PA, min_rvol=MIN_RVOL, random_dir=None)
     p.update(params or {})
     variants = variants or {"Price action": True, "Indicators only": False}
@@ -1457,7 +1338,6 @@ def telegram_text(res):
         lines += [
             f"{star}{'🟢' if side == 'CALL' else '🔴'} {side} {o['symbol']} {o['strike']:g} exp {o['expiry']}",
             f"Entry {p['entry']} | SL {p['sl']} | TP {p['tp']} (+${p['profit_1lot']:.0f}/lot)",
-            f"R:R {p['rr']} ({p['tp_note']}) | safer: half off at {p['tp1']}, then SL to entry",
             f"Δ{o['delta']:.2f} Γ{o['gamma']:.3f} Θ{o['theta']:.2f} V{o['vega']:.2f} ρ{o['rho']:.2f} IV{o['iv'] * 100:.0f}%",
             f"Stock {a['spot']:.2f} → day est {a['pred_close']:.2f} (H {a['pred_high']:.2f} / L {a['pred_low']:.2f})",
         ]
@@ -1633,23 +1513,19 @@ def render_commodities(quotes):
             cols = st.columns(4)
             for c, (name, cands) in zip(cols, COMMODITIES[i:i + 4]):
                 s = sigs.get(name)
-                d = ctrader_quote(name)
-                src_lbl = d["sym"] if d else None
-                if not d and COMM_YAHOO_FALLBACK:
-                    d = quotes.get(cands[0])
+                d = quotes.get(cands[0])
                 with c:
                     with st.container(border=True):
                         st.markdown(f"**{name}**")
                         if d:
-                            st.metric(f"{src_lbl} (cTrader)" if src_lbl else cands[0].replace("=F", " futures"), _pxf(d["price"]),
+                            st.metric(cands[0].replace("=F", " futures"), _pxf(d["price"]),
                                       f"{d['chg']:+,.3f} ({d['pct']:+.2f}%)" if abs(d["price"]) < 10
                                       else f"{d['chg']:+,.2f} ({d['pct']:+.2f}%)")
                         else:
                             st.metric(cands[0], "n/a")
                         sig = (s or {}).get("signal", "N/A")
                         if sig == "N/A":
-                            st.warning("No cTrader price - start the PriceFeedExporter cBot in cTrader" if not COMM_YAHOO_FALLBACK
-                                       else "No data feed for this symbol")
+                            st.warning("No data feed for this symbol")
                         elif sig == "CLOSED":
                             st.warning("Market closed")
                         else:
@@ -1665,7 +1541,7 @@ def render_commodities(quotes):
                                            f"R:R {s['rr']:.1f}")
                             st.caption(f"1h range est {_pxf(s['spot'] - s['hr_move'])} - {_pxf(s['spot'] + s['hr_move'])} | "
                                        f"RSI {s['rsi']:.0f}")
-                            st.caption(" ".join(s["tags"]) + f"  | feed: {s.get('source', 'Yahoo')}")
+                            st.caption(" ".join(s["tags"]))
                             if s.get("stale"):
                                 t0 = dt.datetime.fromisoformat(s["time"])
                                 st.caption(f"Market closed - last live call {t0.strftime('%a %H:%M')} ET")
@@ -1720,171 +1596,6 @@ def _quote_bar(o, entry):
             f'{bar}{labels}</div>')
 
 
-# ----- Moomoo-style order ticket as a PNG image (shown on the page and sent to Telegram) -----
-try:
-    from PIL import Image, ImageDraw, ImageFont
-    HAVE_PIL = True
-except Exception:
-    HAVE_PIL = False
-
-
-def _tfont(size, bold=False):
-    names = ["arialbd.ttf", "segoeuib.ttf", "DejaVuSans-Bold.ttf"] if bold else ["arial.ttf", "segoeui.ttf", "DejaVuSans.ttf"]
-    for n in names:
-        try:
-            return ImageFont.truetype(n, size)
-        except Exception:
-            continue
-    try:
-        return ImageFont.load_default(size=size)
-    except Exception:
-        return ImageFont.load_default()
-
-
-def ticket_png(item, title=None):
-    """PNG that looks like the Moomoo order ticket, filled with the exact values to enter. None if Pillow is missing."""
-    if not HAVE_PIL:
-        return None
-    try:
-        import io
-        o, p, a = item["opt"], item["plan"], item["a"]
-        S, W, pad = 2, 440, 22                                   # drawn at 2x for a sharp image
-        img = Image.new("RGB", (W * S, 1300 * S), _BG)
-        d = ImageDraw.Draw(img)
-        f_s, f_m, f_b, f_t = _tfont(14 * S), _tfont(17 * S), _tfont(17 * S, True), _tfont(22 * S, True)
-        y = pad
-
-        def txt(x, yy, t, f, fill=_TXT, anchor="l"):             # (x, yy) = left / middle / right edge, vertical centre
-            try:
-                d.text((x * S, yy * S), t, font=f, fill=fill, anchor=anchor + "m")
-            except Exception:
-                w = d.textlength(t, font=f) / S
-                d.text(((x - (w if anchor == "r" else w / 2 if anchor == "m" else 0)) * S, (yy - 8) * S), t, font=f, fill=fill)
-
-        def box(x0, y0, x1, y1, fill=_FIELD):
-            d.rounded_rectangle((x0 * S, y0 * S, x1 * S, y1 * S), radius=5 * S, fill=fill, outline=_LINE, width=S)
-
-        def label(t):
-            nonlocal y
-            txt(pad, y + 9, t, f_s, _MUT)
-            y += 24
-
-        def field(t, fill=_TXT, bg=_FIELD, right=None):
-            nonlocal y
-            box(pad, y, W - pad, y + 40, bg)
-            txt(pad + 12, y + 20, t, f_m, fill)
-            if right:
-                txt(W - pad - 12, y + 20, right, f_m, _MUT, "r")
-            y += 40 + 10
-
-        def stepper(v, color=_TXT):
-            nonlocal y
-            box(pad, y, W - pad, y + 40)
-            txt(pad + 18, y + 20, "-", f_b, _MUT, "m")
-            txt(W / 2, y + 20, v, f_b, color, "m")
-            txt(W - pad - 18, y + 20, "+", f_b, _MUT, "m")
-            y += 40 + 6
-
-        def note(t, color):
-            nonlocal y
-            txt(pad, y + 8, t, f_s, color)
-            y += 26
-
-        def check(x, yy, t):
-            d.rounded_rectangle((x * S, (yy - 8) * S, (x + 16) * S, (yy + 8) * S), radius=3 * S, fill=_BLU)
-            d.line([((x + 4) * S, yy * S), ((x + 7) * S, (yy + 4) * S), ((x + 12) * S, (yy - 4) * S)], fill="#ffffff", width=2 * S)
-            txt(x + 24, yy, t, f_m)
-
-        code = opt_code(o)
-        gain_pct = (p["tp"] / p["entry"] - 1) * 100
-        loss_pct = (1 - p["sl"] / p["entry"]) * 100
-
-        txt(pad, y + 14, "Trade", f_t)
-        txt(W - pad, y + 14, title or f"{o['symbol']} {o['side']}", f_s, _BLU, "r")
-        y += 44
-        label("Contract")
-        box(pad, y, pad + 270, y + 40)
-        txt(pad + 12, y + 20, code, f_m)
-        box(pad + 282, y, W - pad, y + 40, "#1d3a2b")
-        txt(pad + 294, y + 20, "Buy", f_m, _GRN)
-        y += 50
-        label("Session")
-        field("RTH only", _MUT)
-        label("Order Type")
-        field("Limit")
-        label("Price")
-        stepper(f"{p['entry']:.2f}")
-        live = bool(o["market_open"]) and o["ask"] > 0
-        mid = (o["bid"] + o["ask"]) / 2 if live else o["last"]
-        txt(pad, y + 8, "Bid", f_s, _MUT)
-        txt(W / 2, y + 8, "Mid", f_s, _MUT, "m")
-        txt(W - pad, y + 8, "Ask", f_s, _MUT, "r")
-        y += 22
-        fmt = (lambda v: f"{v:.2f}") if live else (lambda v: "--")
-        txt(pad, y + 8, fmt(o["bid"]), f_s)
-        txt(W / 2, y + 8, fmt(mid) if live else (f"{o['last']:.2f}" if o["last"] else "--"), f_s, _TXT, "m")
-        txt(W - pad, y + 8, fmt(o["ask"]), f_s, _TXT, "r")
-        y += 30
-        label("Contracts x100 shares")
-        stepper("1")
-        label("TIF")
-        field("Day")
-        check(pad, y + 12, "Take Profit")
-        check(pad + 190, y + 12, "Stop Loss")
-        y += 36
-        label("TP Price")
-        stepper(f"{p['tp']:.2f}")
-        note(f"+${p['profit_1lot']:,.0f} per lot (+{gain_pct:.0f}%)", _GRN)
-        label("SL Price")
-        stepper(f"{p['sl']:.2f}")
-        note(f"-${p['loss_1lot']:,.0f} per lot (-{loss_pct:.0f}%)", _RED)
-        label("TIF")
-        field("GTC")
-        txt(pad, y + 12, "Amount", f_m, _MUT)
-        txt(W - pad, y + 12, f"{p['cost_1lot']:,.2f} USD (Debit)", f_b, _TXT, "r")
-        y += 36
-        d.rounded_rectangle((pad * S, y * S, (W - pad) * S, (y + 44) * S), radius=5 * S, fill=_ORG)
-        txt(W / 2, y + 22, "Enter these values in Moomoo", f_b, "#ffffff", "m")
-        y += 58
-        txt(pad, y + 8, f"{o['symbol']} {a['spot']:.2f} | strike {o['strike']:g} {o['side']} | exp {o['expiry']} ({o['dte']}d)", f_s, _MUT)
-        y += 22
-        txt(pad, y + 8, f"Delta {o['delta']:.2f} | IV {o['iv'] * 100:.0f}% | R:R {p['rr']} | day est {a['pred_close']:.2f}", f_s, _MUT)
-        y += 22
-        txt(pad, y + 8, f"R:R {p['rr']} | safer: sell half at {p['tp1']:.2f}, then move SL to entry", f_s, _MUT)
-        y += 30
-        img = img.crop((0, 0, W * S, y * S))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
-    except Exception:
-        return None
-
-
-def send_telegram_photo(cfg, png, caption=""):
-    token = os.getenv("TELEGRAM_BOT_TOKEN") or cfg.get("telegram_bot_token")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID") or cfg.get("telegram_chat_id")
-    if not token or not chat_id or not png:
-        return False
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{token}/sendPhoto",
-                          data={"chat_id": chat_id, "caption": caption[:1000]},
-                          files={"photo": ("ticket.png", png, "image/png")}, timeout=30)
-        return r.ok
-    except Exception:
-        return False
-
-
-def send_tickets(cfg, res):
-    """After the text alert: one Moomoo-style order-ticket picture per side (CALL / PUT) with the exact values."""
-    for side in ("CALL", "PUT"):
-        it = res.get(side)
-        if not it:
-            continue
-        o = it["opt"]
-        star = " (TOP PICK)" if res.get("top") == side else ""
-        send_telegram_photo(cfg, ticket_png(it), f"{side} {o['symbol']} {opt_code(o)}{star} - enter in Moomoo")
-
-
 def order_ticket_html(item):
     """Looks like the Moomoo order ticket, filled with the scanner's values."""
     o, p = item["opt"], item["plan"]
@@ -1933,7 +1644,7 @@ def order_ticket_html(item):
     return html
 
 
-def draw_box_full(item, side, is_top, ns=""):
+def draw_box(item, side, is_top, ns=""):
     icon = "🟢" if side == "CALL" else "🔴"
     if not item:
         with st.container(border=True):
@@ -1993,61 +1704,9 @@ def draw_box_full(item, side, is_top, ns=""):
             st.caption("Exit: at TP or SL, early if a 5-min bar closes back through EMA15 against you, "
                        "otherwise by 15:45 ET.")
         with right:
-            _png = ticket_png(item)
-            if _png:
-                st.image(_png, width=380)
+            st.markdown(order_ticket_html(item), unsafe_allow_html=True)
         if st.toggle(f"Show {o['symbol']} {opt_code(o)} option chart", value=True, key=f"oc_{ns}_{side}_{o['contract']}"):
             option_chart(item)
-
-
-def draw_box(item, side, is_top, ns=""):
-    """Compact call / put card. Switch 'Compact call/put boxes' off in the sidebar for the full-size view."""
-    if not st.session_state.get("compact_view", True):
-        return draw_box_full(item, side, is_top, ns)
-    icon = "🟢" if side == "CALL" else "🔴"
-    if not item:
-        with st.container(border=True):
-            st.markdown(f"**{icon} {side}** - no qualifying contract this scan")
-            st.caption(f"Needs |score| >= {MIN_SCORE}, volume >= {MIN_RVOL}x, no earnings before expiry, delta "
-                       f"{DELTA_MIN}-{DELTA_MAX}, spread <= {MAX_SPREAD_PCT:g}%, OI >= {MIN_OI}, R:R >= {MIN_RR}. "
-                       "Waiting for a cleaner setup is intended.")
-        return
-    o, p, a = item["opt"], item["plan"], item["a"]
-    pa = a["pa"]
-    top_txt = "  ⭐ TOP PICK" if is_top else ""
-    strength = "STRONG" if item["strong"] else "moderate"
-    with st.container(border=True):
-        st.markdown(f"**{icon} {side} · {o['symbol']} {opt_code(o)}**{top_txt}  ·  exp {o['expiry']} ({o['dte']}d)"
-                    f"  ·  {strength} {a['score']:+d}")
-        m = st.columns(4)
-        m[0].metric("Entry", f"{p['entry']:.2f}")
-        m[1].metric("Take profit", f"{p['tp']:.2f}", f"+${p['profit_1lot']:,.0f}")
-        m[2].metric("Stop loss", f"{p['sl']:.2f}", f"-${p['loss_1lot']:,.0f}")
-        m[3].metric("Reward:Risk", f"{p['rr']}")
-        st.caption(f"**Why this R:R:** {p['tp_note']}. Needs only {p['be_win']:.0f}% winners to break even. "
-                   f"Safer: sell half at {p['tp1']:.2f} (1x risk), then move the stop to {p['entry']:.2f}.")
-        st.caption(f"Δ{o['delta']:.2f} Γ{o['gamma']:.3f} Θ{o['theta']:.2f} V{o['vega']:.2f} ρ{o['rho']:.2f} · "
-                   f"IV {o['iv'] * 100:.0f}% · Bid/Ask {o['bid']:.2f}/{o['ask']:.2f} ({o['spread']:.1f}%) · "
-                   f"Vol/OI {o['vol']}/{o['oi']}")
-        st.caption(f"Stock {a['spot']:.2f} → day est {a['pred_close']:.2f} (H {a['pred_high']:.2f} / L {a['pred_low']:.2f}) · "
-                   f"RSI {a['rsi']:.0f} · RVOL {a['rvol']:.1f}x · {pa['struct']} · {' '.join(a['tags'])}"
-                   f"{' · BLOCKED (level too close)' if 'PA:blocked' in a['tags'] else ''}")
-        if not o["market_open"]:
-            st.caption("Option quotes not live - last price used. Confirm bid/ask before entry.")
-        with st.expander("Order ticket - enter these values in Moomoo", expanded=True):
-            png = ticket_png(item)
-            if png:
-                st.image(png, width=380)
-            else:
-                st.caption("Install Pillow (pip install pillow) to see the order ticket picture.")
-        with st.expander("Option chart"):
-            link = tv_option_url(o)
-            try:
-                st.link_button(f"📈 {o['symbol']} {opt_code(o)} on TradingView (OPRA)", link)
-            except AttributeError:
-                st.markdown(f"[📈 {o['symbol']} {opt_code(o)} on TradingView (OPRA)]({link})")
-            if st.toggle("Load option chart", value=False, key=f"oc_{ns}_{side}_{o['contract']}"):
-                option_chart(item)
 
 
 def render_scan(res, empty_msg, ns=""):
@@ -2065,15 +1724,8 @@ def render_scan(res, empty_msg, ns=""):
     st.write(f"Scan time: **{when.strftime('%a %d %b %H:%M')} ET** ({fmt_local(when)} your time) | "
              f"{res.get('scanned', '?')}/{len(SYMBOLS)} stocks read | "
              f"{MARKET_SYM} market bias: **{_bias_txt(res.get('market', 0))}**{tg}")
-    if st.session_state.get("compact_view", True):
-        col_c, col_p = st.columns(2)
-        with col_c:
-            draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL", f"{ns}{res['time']}")
-        with col_p:
-            draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT", f"{ns}{res['time']}")
-    else:
-        draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL", f"{ns}{res['time']}")
-        draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT", f"{ns}{res['time']}")
+    draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL", f"{ns}{res['time']}")
+    draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT", f"{ns}{res['time']}")
     with st.expander("All stocks - direction score & day estimate"):
         if res.get("table"):
             st.dataframe(pd.DataFrame(res["table"]).sort_values("score", key=abs, ascending=False))
@@ -2251,99 +1903,6 @@ def cli_backtest(days):
         print(_breakdown(g, "scan").to_string())
     print(f"\nTrades saved to {BT_FILE}")
 
-# ----------------------------- BACKGROUND SERVICE -----------------------------
-# python us_itm_scanner.py --daemon   runs every scheduled scan + the hourly commodity calls and sends Telegram,
-# with no browser page needed. The Streamlit page then only DISPLAYS what the service found (and still has manual scans).
-HEARTBEAT_FILE = "daemon_heartbeat.json"
-DAEMON_LOG = "daemon.log"
-DAEMON_POLL_SEC = 15
-
-
-def _dlog(msg):
-    line = f"{dt.datetime.now(ET):%Y-%m-%d %H:%M:%S} ET  {msg}"
-    try:
-        print(line, flush=True)
-    except Exception:
-        pass
-    try:
-        with open(DAEMON_LOG, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
-
-
-def daemon_alive(max_age=60):
-    hb = _load_json(HEARTBEAT_FILE)
-    try:
-        return (time.time() - float(hb.get("ts", 0))) <= max_age
-    except Exception:
-        return False
-
-
-def _heartbeat_loop(stop):
-    while not stop.is_set():
-        try:
-            _save_json(HEARTBEAT_FILE, {"ts": time.time(), "pid": os.getpid(),
-                                        "time": dt.datetime.now(ET).isoformat(timespec="seconds")})
-        except Exception:
-            pass
-        stop.wait(10)
-
-
-def run_daemon():
-    if daemon_alive():
-        print("The background service is already running (heartbeat is fresh). Exiting.")
-        return
-    stop = threading.Event()
-    threading.Thread(target=_heartbeat_loop, args=(stop,), daemon=True).start()
-    cfg = load_config()
-    _dlog("Background scanner started")
-    send_telegram(cfg, "✅ Scanner background service started - scans 09:45 ET then every 30 min to 14:45 ET, commodities hourly.")
-    try:
-        while True:
-            cfg = load_config()                      # picks up a changed Telegram token without a restart
-            try:
-                key = run_scheduled(cfg)
-                if key:
-                    _dlog(f"scan '{key}' finished")
-                if run_commodities(cfg):
-                    _dlog("commodity update done")
-            except Exception as e:
-                _dlog(f"error: {e}")
-            time.sleep(DAEMON_POLL_SEC)
-    except KeyboardInterrupt:
-        _dlog("Stopped by user")
-    finally:
-        stop.set()
-
-
-def _state_sig():
-    sig = []
-    for f in (STATE_FILE, COMM_FILE):
-        try:
-            sig.append(os.path.getmtime(f))
-        except OSError:
-            sig.append(0)
-    return tuple(sig)
-
-
-def viewer_loop(mkt_box):
-    """Page is only a viewer (the background service does the scans): refresh when it writes new results."""
-    sig0, last = _state_sig(), time.time()
-    box = st.empty()
-    while True:
-        time.sleep(3)
-        if _state_sig() != sig0:
-            st.rerun()
-        if time.time() - last >= MARKET_REFRESH_SEC:
-            render_market(mkt_box)
-            last = time.time()
-        nxt, when = next_scan(dt.datetime.now(ET))
-        if when:
-            box.caption(f"Background service is running. Next scan: **{nxt[4]}** at {when.strftime('%a %H:%M')} ET "
-                        f"({fmt_local(when)} your time). This page updates by itself.")
-
-
 # ----------------------------- STREAMLIT UI -----------------------------
 
 def main():
@@ -2351,15 +1910,11 @@ def main():
     cfg = load_config()
 
     st.title("📈 US Top-100 Call / Put Scanner")
-    st.caption("Scans: 09:45 ET, then every 30 minutes 10:15-14:45 ET - each one is sent to Telegram. Next expiry (not same "
+    st.caption("Scans: 09:45 ET, then every hour 10:45-14:45 ET - each one is sent to Telegram. Next expiry (not same "
                "day) - all Greeks + price action + market filter - educational only, not advice.")
 
     with st.sidebar:
-        alive = daemon_alive()
-        auto = st.toggle("Auto scans in this page (turn OFF when the background service runs)", value=not alive)
-        st.toggle("Compact call/put boxes", value=True, key="compact_view")
-        if alive:
-            st.success("Background service is running ✅ (scans + Telegram)")
+        auto = st.toggle("Auto scans (see schedule)", value=True)
         with st.expander("Telegram"):
             bot = st.text_input("Bot token", value=cfg.get("telegram_bot_token", ""), type="password")
             chat = st.text_input("Chat ID", value=cfg.get("telegram_chat_id", ""))
@@ -2370,15 +1925,12 @@ def main():
                 st.success("Saved")
             if b2.button("Test"):
                 st.success("Sent") if send_telegram(cfg, "✅ Scanner test message") else st.error("Not sent")
-        st.caption("Manual scans: use the buttons at the top of the page.")
+        st.markdown("**Manual run** (screen only, no Telegram)")
+        run_pre = st.button("Premarket scan now")
+        run_open = st.button("Open-style scan now")
+        run_hourly = st.button("Hourly-style scan now")
 
     # indices box + top 10 shares first, so they show while a scan is running
-    top = st.container()                         # call / put section lives here, ABOVE the indices box
-    bc = top.columns([1, 1, 1, 1.4])
-    run_pre = bc[0].button("▶ Premarket scan now")
-    run_open = bc[1].button("▶ Open-style scan now")
-    run_hourly = bc[2].button("▶ 30-min scan now")
-    tg_manual = bc[3].checkbox("Send manual scan to Telegram", value=True)
     mkt_box = st.empty()
     render_market(mkt_box)
     if run_commodities(cfg):                     # hourly commodity calls (own schedule, own file)
@@ -2389,13 +1941,10 @@ def main():
 
     manual = st.session_state.setdefault("manual", {})
     for flag, mode, label in ((run_pre, "pre", "Premarket (manual)"), (run_open, "open", "Open (manual)"),
-                              (run_hourly, "hourly", "30-min (manual)")):
+                              (run_hourly, "hourly", "Hourly (manual)")):
         if flag:
             with st.spinner(f"Scanning {len(SYMBOLS)} stocks..."):
                 manual[mode] = scan_once(mode, pre_scores_today(load_state()) if mode != "pre" else None, label)
-                if tg_manual:
-                    manual[mode]["telegram"] = send_telegram(cfg, telegram_text(manual[mode]))
-                    send_tickets(cfg, manual[mode])
 
     state = load_state()
     now = dt.datetime.now(ET)
@@ -2418,13 +1967,13 @@ def main():
             marks.append(f"✅ {start:%H:%M}")
         else:
             marks.append(f"⏳ {start:%H:%M}")
-    top.caption("Today (ET): " + "  ".join(marks))
+    st.caption("Today (ET): " + "  ".join(marks))
 
     def newest(key, mode):
         a, b = scheduled.get(key), manual.get(mode)
         return max([x for x in (a, b) if ok(x)], key=when_of) if (ok(a) or ok(b)) else (state.get(key) or None)
 
-    t_latest, t_open, t_hour, t_bt = top.tabs(["Latest scan", "Open 09:45", "30-min scans", "Backtest"])
+    t_latest, t_open, t_hour, t_bt = st.tabs(["Latest scan", "Open 09:45", "Hourly scans", "Backtest"])
     with t_latest:
         render_scan(latest, "No scan yet - the first one runs at 09:45 ET (or use a manual run).", "latest")
     with t_open:
@@ -2432,16 +1981,14 @@ def main():
     with t_hour:
         hourly = sorted([r for r in everything if r.get("mode") == "hourly"], key=when_of, reverse=True)
         if hourly:
-            names = [f"{h.get('label', 'Scan')} - {when_of(h):%a %H:%M} ET" for h in hourly]
-            pick = st.selectbox("30-min scan", names, index=0)
+            names = [f"{h.get('label', 'Hourly')} - {when_of(h):%a %H:%M} ET" for h in hourly]
+            pick = st.selectbox("Hourly scan", names, index=0)
             render_scan(hourly[names.index(pick)], "", "hour")
         else:
-            st.info("No 30-minute scan yet - they run at 10:15, 10:45, 11:15 ... 14:15 and 14:45 ET.")
+            st.info("No hourly scan yet - they run at 10:45, 11:45, 12:45, 13:45 and 14:45 ET.")
     with t_bt:
         render_backtest_tab()
 
-    if not auto and daemon_alive():
-        viewer_loop(mkt_box)
     if auto:
         box = st.empty()
         last_mkt = time.time()
@@ -2464,9 +2011,7 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--daemon" in sys.argv:
-        run_daemon()
-    elif "--sweep" in sys.argv:
+    if "--sweep" in sys.argv:
         i = sys.argv.index("--sweep")
         cli_sweep(int(sys.argv[i + 1]) if len(sys.argv) > i + 1 and sys.argv[i + 1].isdigit() else 40)
     elif "--backtest" in sys.argv:
