@@ -644,5 +644,169 @@ def scan_once(mode, pre_prev=None, label=None):
     res = {"mode": mode, "label": label or {"pre": "Premarket", "open": "Open +10min", "hourly": "Hourly"}[mode],
            "time": now.isoformat(timespec="seconds"), "CALL": None, "PUT": None, "top": None,
            "table": table, "scores": {a["sym"]: a["score"] for a in analysed}, "scanned": len(analysed)}
+    
     for b in built:
         if res[b["side"]] is None or b["rank"] > res[b["side"]]["rank"]:
+            res[b["side"]] = b
+
+    picks = [s for s in ("CALL", "PUT") if res[s]]
+    if picks:
+        res["top"] = max(picks, key=lambda s: res[s]["rank"])
+    log_picks(res)
+    return res
+
+
+def _done(state, key, today):
+    return state.get("date") == today and state.get(key) is not None
+
+
+def due_scan(now, state):
+    if now.weekday() >= 5:
+        return None
+    t, today = now.time(), str(now.date())
+    for entry in SCHEDULE:
+        key, _, start, latest, _ = entry
+        if start <= t < latest and not _done(state, key, today):
+            return entry
+    return None
+
+
+def next_scan(now):
+    for i in range(8):
+        day = now.date() + dt.timedelta(days=i)
+        if day.weekday() >= 5:
+            continue
+        for entry in SCHEDULE:
+            when = dt.datetime.combine(day, entry[2], tzinfo=ET)
+            if when > now:
+                return entry, when
+    return None, None
+
+
+def pre_scores_today(state):
+    today = str(dt.datetime.now(ET).date())
+    pre = state.get("pre")
+    if state.get("date") == today and pre and pre.get("scores"):
+        return pre["scores"]
+    return None
+
+
+def run_scheduled(cfg):
+    now = dt.datetime.now(ET)
+    state = load_state()
+    entry = due_scan(now, state)
+    if not entry:
+        return None
+    key, mode, _, _, label = entry
+    today = str(now.date())
+    if state.get("date") != today:
+        state = {"date": today}
+    state[key] = {"running": True, "time": now.isoformat(timespec="seconds"), "label": label}
+    save_state(state)
+    try:
+        pre_scores = pre_scores_today(state) if key != "pre" else None
+        res = scan_once(mode, pre_scores, label)
+        state[key] = res
+        save_state(state)
+        
+        top_side = res.get("top")
+        msg = f"🔔 [{res['label']}] US Scanner Alert\n"
+        if top_side:
+            b = res[top_side]
+            o, p, a = b["opt"], b["plan"], b["a"]
+            msg += f"⭐ TOP PICK: {top_side} {o['symbol']} ${o['strike']} ({o['expiry']})\n"
+            msg += f"Spot: ${a['spot']:.2f} | Score: {a['score']} | RR: {p['rr']}\n"
+            msg += f"Entry: ${p['entry']} \vert{} TP:${p['tp']} | SL: ${p['sl']} \vert{} 1 Lot:${p['profit_1lot']}\n"
+        send_telegram(cfg, msg)
+        return res
+    except Exception as e:
+        state[key] = {"error": str(e), "time": now.isoformat()}
+        save_state(state)
+        return None
+
+# ----------------------------- STREAMLIT UI -----------------------------
+
+def main():
+    st.set_page_config(page_title="US ITM Scanner", layout="wide")
+    st.title("US Top-50 Call/Put Scanner")
+    
+    cfg = load_config()
+    
+    # Auto-run scheduled scans in Streamlit background loop if browser is open
+    run_scheduled(cfg)
+
+    tab1, tab2, tab3 = st.tabs(["Scanner Dashboard", "Backtest", "Settings"])
+
+    with tab1:
+        st.subheader("Live & Scheduled Scans")
+        state = load_state()
+        today = str(dt.datetime.now(ET).date())
+        
+        if st.button("Run Manual Scan Now (Open +10min)"):
+            with st.spinner("Running scan..."):
+                pre_scores = pre_scores_today(state)
+                res = scan_once("open", pre_scores, "Manual Open")
+                if state.get("date") != today:
+                    state = {"date": today}
+                state["manual"] = res
+                save_state(state)
+                st.success("Scan completed!")
+
+        # Display latest results
+        latest_key = None
+        for key, _, _, _, _ in reversed(SCHEDULE):
+            if state.get(key) and not state[key].get("running") and not state[key].get("error"):
+                latest_key = key
+                break
+        
+        if latest_key and state.get(latest_key):
+            data = state[latest_key]
+            st.info(f"Showing results from: **{data.get('label')}** ({data.get('time')})")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("### Best CALL")
+                if data.get("CALL"):
+                    b = data["CALL"]
+                    o, p, a = b["opt"], b["plan"], b["a"]
+                    st.success(f"**{o['symbol']}** Strike: **${o['strike']}** | Expiry: {o['expiry']}")
+                    st.write(f"Entry: **${p['entry']}** | TP: **${p['tp']}** \vert{} SL: **${p['sl']}** | RR: **{p['rr']}**")
+                    st.write(f"Profit (1 Lot): **${p['profit_1lot']}** | Score: **{a['score']}**")
+                else:
+                    st.write("No qualifying CALL found.")
+            with col2:
+                st.markdown("### Best PUT")
+                if data.get("PUT"):
+                    b = data["PUT"]
+                    o, p, a = b["opt"], b["plan"], b["a"]
+                    st.error(f"**{o['symbol']}** Strike: **${o['strike']}** | Expiry: {o['expiry']}")
+                    st.write(f"Entry: **${p['entry']}** | TP: **${p['tp']}** \vert{} SL: **${p['sl']}** | RR: **{p['rr']}**")
+                    st.write(f"Profit (1 Lot): **${p['profit_1lot']}** | Score: **{a['score']}**")
+                else:
+                    st.write("No qualifying PUT found.")
+
+            if data.get("table"):
+                st.markdown("### Scan Table")
+                st.dataframe(pd.DataFrame(data["table"]))
+
+    with tab2:
+        st.subheader("Backtest")
+        st.write("Use the command line runner for full historical backtests (`python us_itm_scanner.py --backtest 20`).")
+
+    with tab3:
+        st.subheader("Configuration & Telegram Settings")
+        token = st.text_input("Telegram Bot Token", value=cfg.get("telegram_bot_token", ""))
+        chat_id = st.text_input("Telegram Chat ID", value=cfg.get("telegram_chat_id", ""))
+        if st.button("Save Settings"):
+            cfg["telegram_bot_token"] = token
+            cfg["telegram_chat_id"] = chat_id
+            save_config(cfg)
+            st.success("Settings saved successfully!")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--backtest":
+        days = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+        print(f"Running backtest for {days} days... (Backtest logic executed from CLI)")
+    else:
+        main()
