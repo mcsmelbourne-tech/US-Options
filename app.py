@@ -727,12 +727,12 @@ def run_scheduled(cfg):
             o, p, a = b["opt"], b["plan"], b["a"]
             msg += f"⭐ TOP PICK: {top_side} {o['symbol']} ${o['strike']} ({o['expiry']})\n"
             msg += f"Spot: ${a['spot']:.2f} | Score: {a['score']} | RR: {p['rr']}\n"
-            msg += f"Entry: ${p['entry']} \vert{} TP:${p['tp']} | SL: ${p['sl']} \vert{} 1 Lot:${p['profit_1lot']}\n"
+            msg += f"Entry: ${p['entry']} | TP:${p['tp']} | SL: ${p['sl']} | 1 Lot:${p['profit_1lot']}\n"
         send_telegram(cfg, msg)
         return res
     except Exception as e:
     # Fixed line without illegal {} inside f-string formatting
-        msg = f"Entry: ${p['entry']} \vert{} TP:${p['tp']} | SL: ${p['sl']} \vert{} 1 Lot:${p['profit_1lot']}\n"
+        msg = f"Entry: ${p['entry']} | TP:${p['tp']} | SL: ${p['sl']} | 1 Lot:${p['profit_1lot']}\n"
         state[key] = {"error": str(e), "time": now.isoformat()}
         save_state(state)
         return None
@@ -783,7 +783,7 @@ def main():
                     b = data["CALL"]
                     o, p, a = b["opt"], b["plan"], b["a"]
                     st.success(f"**{o['symbol']}** Strike: **${o['strike']}** | Expiry: {o['expiry']}")
-                    st.write(f"Entry: **${p['entry']}** | TP: **${p['tp']}** \vert{} SL: **${p['sl']}** | RR: **{p['rr']}**")
+                    st.write(f"Entry: **${p['entry']}** | TP: **${p['tp']}** | SL: **${p['sl']}** | RR: **{p['rr']}**")
                     st.write(f"Profit (1 Lot): **${p['profit_1lot']}** | Score: **{a['score']}**")
                 else:
                     st.write("No qualifying CALL found.")
@@ -793,7 +793,7 @@ def main():
                     b = data["PUT"]
                     o, p, a = b["opt"], b["plan"], b["a"]
                     st.error(f"**{o['symbol']}** Strike: **${o['strike']}** | Expiry: {o['expiry']}")
-                    st.write(f"Entry: **${p['entry']}** | TP: **${p['tp']}** \vert{} SL: **${p['sl']}** | RR: **{p['rr']}**")
+                    st.write(f"Entry: **${p['entry']}** | TP: **${p['tp']}** | SL: **${p['sl']}** | RR: **{p['rr']}**")
                     st.write(f"Profit (1 Lot): **${p['profit_1lot']}** | Score: **{a['score']}**")
                 else:
                     st.write("No qualifying PUT found.")
