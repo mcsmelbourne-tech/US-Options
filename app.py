@@ -95,14 +95,12 @@ SL_MOVE_FRAC = 0.5                           # stock stop = 50% of the expected 
 MIN_LOSS, MAX_LOSS = 0.10, 0.30              # option stop loss clamped to 10-30% of premium
 MIN_RR = 1.3                                 # skip trades with reward:risk below this
 REQUIRE_PA = False                           # True = only trade when price action points the same way as the trade
-# TP_FRAC / SL_MOVE_FRAC / MAX_LOSS / MIN_SCORE / MIN_RR / REQUIRE_PA are what the Backtest tab's "Sweep" tunes -
-# copy the values it finds here (live scans and the backtest both read these).
 
 # price action
 SWING_K = 3                                  # a swing high/low = extreme of 3 bars either side (5-min bars)
 BLOCKED_FRAC = 0.35                          # next S/R closer than 35% of the expected move = trade is "blocked"
 
-# backtest assumptions (yfinance has no history of option quotes, so the option is MODELLED)
+# backtest assumptions
 BT_IV_MULT = 1.10                            # assumed option IV = 20-day historical vol x this
 BT_SLIPPAGE = 0.02                           # 2% of premium lost on entry and on stop / time exits
 BT_COMMISSION = 0.65                         # $ per contract per side
@@ -224,7 +222,6 @@ def bs_price(S, K, T, sigma, side, r=RISK_FREE):
 
 
 def greeks(S, K, T, sigma, side, r=RISK_FREE):
-    """delta, gamma, theta (per day), vega (per 1 vol point), rho (per 1% rate) - all per share."""
     if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
         return None
     d1, d2 = _d1d2(S, K, T, sigma, r)
@@ -260,7 +257,6 @@ def _clean_intraday(df):
 
 
 def fetch_intraday(sym):
-    """5-minute bars incl. premarket (04:00-16:00 ET), last 5 days."""
     return _clean_intraday(yf.Ticker(sym).history(period="5d", interval="5m", prepost=True))
 
 
@@ -274,8 +270,6 @@ def fetch_daily(sym, period="3mo"):
 # ----------------------------- PRICE ACTION -----------------------------
 
 def _swings(df, k=SWING_K):
-    """Confirmed swing highs / lows (prices, oldest -> newest). A swing needs k bars on each side, so it never
-    uses future data."""
     hi, lo = df["high"].to_numpy(), df["low"].to_numpy()
     sh, sl = [], []
     for i in range(k, len(df) - k):
@@ -288,9 +282,6 @@ def _swings(df, k=SWING_K):
 
 
 def price_action(df, hist_d, spot, atr5, pm_high, pm_low, mode):
-    """Returns (points, tags, info). Points are added to the indicator score.
-       +1/-1 each: swing structure, break of structure, candle pattern, previous-day high/low break.
-       info also holds the nearest support/resistance ('room') and the last swing low/high (stop reference)."""
     pts, tags = 0, []
 
     def add(v, tag):
@@ -305,7 +296,6 @@ def price_action(df, hist_d, spot, atr5, pm_high, pm_low, mode):
     info = dict(struct="none", candle="none", pdh=pdh, pdl=pdl, sw_hi=None, sw_lo=None,
                 room_up=None, room_dn=None)
 
-    # 1) swing structure + break of structure
     if len(sh) >= 2 and len(sl) >= 2:
         if sh[-1] > sh[-2] and sl[-1] > sl[-2]:
             add(1, "HH/HL")
@@ -320,7 +310,6 @@ def price_action(df, hist_d, spot, atr5, pm_high, pm_low, mode):
     elif sl and spot < sl[-1]:
         add(-1, "BOS-down")
 
-    # 2) candle pattern on the last bar, only where it matters (reversal at an extreme, or a strong bar)
     if mode != "pre" and len(reg) >= 14:
         b0, b1 = reg.iloc[-1], reg.iloc[-2]
         o0, c0, h0, l0 = float(b0["open"]), float(b0["close"]), float(b0["high"]), float(b0["low"])
@@ -351,13 +340,11 @@ def price_action(df, hist_d, spot, atr5, pm_high, pm_low, mode):
                 add(-1, "Strong bar")
                 info["candle"] = "Strong red bar"
 
-    # 3) previous-day high / low
     if spot > pdh:
         add(1, "PDH-break")
     elif spot < pdl:
         add(-1, "PDL-break")
 
-    # 4) nearest support / resistance ("room") and the stop reference swings
     levels = [pdh, pdl] + [x for x in (pm_high, pm_low) if x is not None] + sh[-4:] + sl[-4:]
     gap = 0.1 * atr5
     above = [x - spot for x in levels if x > spot + gap]
@@ -368,12 +355,9 @@ def price_action(df, hist_d, spot, atr5, pm_high, pm_low, mode):
     info["sw_hi"] = next((x for x in reversed(sh) if x > spot + gap), None)
     return pts, tags, info
 
-# ----------------------------- STOCK ANALYSIS + DAY PREDICTION -----------------------------
+# ----------------------------- ANALYSIS & SCANNING -----------------------------
 
 def analyse_df(sym, df, dd, mode):
-    """Indicators + price action from the data given (the last bar of df = 'now'). Works for live data and for
-    the backtest (df cut at the scan time). mode: 'pre', 'open' or 'hourly'. Returns the raw pieces; finalize()
-    turns them into the score and the day prediction."""
     try:
         if df is None or dd is None or len(df) < 40:
             return None
@@ -383,7 +367,7 @@ def analyse_df(sym, df, dd, mode):
         if len(hist_d) < 20:
             return None
         prev_close = float(hist_d["close"].iloc[-1])
-        day_atr = float(atr(hist_d).iloc[-1])                               # daily ATR(14)
+        day_atr = float(atr(hist_d).iloc[-1])
         avg_vol = float(hist_d["volume"].tail(20).mean())
         hv = float(np.log(hist_d["close"]).diff().dropna().tail(20).std() * math.sqrt(252))
 
@@ -416,17 +400,15 @@ def analyse_df(sym, df, dd, mode):
 
         if mode != "pre" and len(reg) > 0 and avg_vol > 0:
             last_bar = df.index[-1]
-            elapsed = (last_bar.hour * 60 + last_bar.minute + 5) - (9 * 60 + 30)       # minutes since the open
-            # typical share of the day's volume traded by then (U-shaped intraday curve)
+            elapsed = (last_bar.hour * 60 + last_bar.minute + 5) - (9 * 60 + 30)
             frac = float(np.interp(elapsed, [0, 10, 30, 60, 120, 180, 240, 300, 360, 390],
                                    [0, 0.07, 0.16, 0.26, 0.40, 0.50, 0.60, 0.72, 0.85, 1.0]))
             rvol = reg_vol / (avg_vol * max(frac, 0.02))
         elif avg_vol > 0:
-            rvol = pm_vol / (avg_vol * 0.03)        # premarket normally ~3% of the day's volume
+            rvol = pm_vol / (avg_vol * 0.03)
         else:
             rvol = 0.0
 
-        # ---- indicator score (direction) ----
         s, tags = 0, []
 
         def add(v, tag):
@@ -449,7 +431,6 @@ def analyse_df(sym, df, dd, mode):
             add(1 if spot > day_open else -1, "vsOpen")
         ob = (-1, "overbought") if rsi_last > 75 else ((1, "oversold") if rsi_last < 25 else (0, ""))
 
-        # ---- price action ----
         pa_s, pa_tags, pa = price_action(df, hist_d, spot, atr5, pm_high, pm_low, mode)
 
         return dict(sym=sym, mode=mode, spot=spot, vwap=vwap, rsi=rsi_last, gap=gap, rvol=float(rvol),
@@ -460,8 +441,6 @@ def analyse_df(sym, df, dd, mode):
 
 
 def finalize(a, use_pa=True, pre_prev=None):
-    """Final score, day prediction and stop reference. use_pa=False gives the original indicator-only score
-    (used by the backtest to compare)."""
     a = dict(a)
     sym = a["sym"]
     s, tags = a["s_core"], list(a["tags_core"])
@@ -473,7 +452,6 @@ def finalize(a, use_pa=True, pre_prev=None):
             tags.append(("+" if v > 0 else "-") + tag)
 
     if a["mode"] != "pre" and pre_prev and pre_prev.get(sym) and s != 0:
-        # premarket scan agreed with today's direction -> strengthen it; disagreed -> weaken it
         agree = (pre_prev[sym] > 0) == (s > 0)
         add((1 if s > 0 else -1) * (1 if agree else -1), "PM-scan")
     add(*a["ob"])
@@ -488,7 +466,7 @@ def finalize(a, use_pa=True, pre_prev=None):
     sign, move = predict(s)
     if use_pa and s != 0:
         room = a["pa"]["room_up"] if s > 0 else a["pa"]["room_dn"]
-        if room is not None and room < BLOCKED_FRAC * move:      # next support/resistance is right in the way
+        if room is not None and room < BLOCKED_FRAC * move:
             s -= sign
             tags.append("PA:blocked")
             sign, move = predict(s)
@@ -506,22 +484,18 @@ def finalize(a, use_pa=True, pre_prev=None):
 
 
 def pa_agrees(a):
-    """True when the price-action points add up in the same direction as the final score."""
     return a["pa_s"] != 0 and (a["pa_s"] > 0) == (a["score"] > 0)
 
 
 def analyse(sym, mode, pre_prev):
-    """Live analysis (current data) with price action on."""
     try:
         base = analyse_df(sym, fetch_intraday(sym), fetch_daily(sym), mode)
         return finalize(base, True, pre_prev) if base else None
     except Exception:
         return None
 
-# ----------------------------- OPTION PICKER (all Greeks) -----------------------------
 
 def pick_option(sym, spot, side, hv):
-    """Next expiry AFTER today -> best contract by delta / gamma / theta / vega / spread / liquidity / IV-vs-HV."""
     try:
         t = yf.Ticker(sym)
         now = dt.datetime.now(ET)
@@ -553,7 +527,7 @@ def pick_option(sym, spot, side, hv):
             market_open = bid > 0 and ask > 0
             if market_open:
                 mid, spread, entry = (bid + ask) / 2, (ask - bid) / ask * 100, ask
-            elif last > 0:                              # no live quote: use last traded price
+            elif last > 0:
                 mid, spread, entry = last, 0.0, last
             else:
                 continue
@@ -565,19 +539,14 @@ def pick_option(sym, spot, side, hv):
                 continue
 
             d = abs(g["delta"])
-            theta_pct = abs(g["theta"]) / max(mid, 0.01) * 100        # daily decay, % of premium
-            gamma_pct = g["gamma"] * spot / max(mid, 0.01) * 100      # responsiveness
-            vega_pct = g["vega"] / max(mid, 0.01) * 100               # premium change per vol point
+            theta_pct = abs(g["theta"]) / max(mid, 0.01) * 100
+            gamma_pct = g["gamma"] * spot / max(mid, 0.01) * 100
+            vega_pct = g["vega"] / max(mid, 0.01) * 100
             iv_ratio = iv / hv if hv > 0 else 1.0
             quality = (
-                100
-                - abs(d - TARGET_DELTA) * 100          # delta near the sweet spot
-                - spread * 2                            # tight spread
-                - theta_pct * 4                         # low time decay
-                + gamma_pct * 2                         # good gamma
-                - vega_pct * 1.0                        # not too IV-sensitive
-                - max(0.0, iv_ratio - 1.2) * 10         # don't overpay for rich IV
-                + math.log10(oi + vol + 1) * 3          # liquidity
+                100 - abs(d - TARGET_DELTA) * 100 - spread * 2 - theta_pct * 4
+                + gamma_pct * 2 - vega_pct * 1.0 - max(0.0, iv_ratio - 1.2) * 10
+                + math.log10(oi + vol + 1) * 3
             )
             rows.append(dict(symbol=sym, side=side, expiry=expiry, dte=dte, T=T,
                              strike=float(o["strike"]), bid=bid, ask=ask, last=last, entry=entry,
@@ -590,9 +559,6 @@ def pick_option(sym, spot, side, hv):
 
 
 def trade_plan(opt, a, tp_frac=None, sl_frac=None, min_loss=None, max_loss=None):
-    """Stock targets from the day prediction, converted to option prices with Black-Scholes.
-       With price action on, the stock stop goes just beyond the last swing low (call) / swing high (put).
-       tp_frac / sl_frac / min_loss / max_loss default to the settings at the top of the file."""
     tp_frac = TP_FRAC if tp_frac is None else tp_frac
     sl_frac = SL_MOVE_FRAC if sl_frac is None else sl_frac
     min_loss = MIN_LOSS if min_loss is None else min_loss
@@ -606,7 +572,7 @@ def trade_plan(opt, a, tp_frac=None, sl_frac=None, min_loss=None, max_loss=None)
     stock_tp = S + sign * a["move"] * tp_frac
     stock_sl = S - sign * a["move"] * sl_frac
     ref = a.get("sl_ref")
-    if ref is not None:                                   # structural stop, kept within a sensible distance
+    if ref is not None:
         dist = abs(S - ref) + 0.1 * a["atr5"]
         if 0.25 * a["move"] <= dist <= max(1.0, sl_frac) * a["move"]:
             stock_sl = S - sign * dist
@@ -628,7 +594,6 @@ def trade_plan(opt, a, tp_frac=None, sl_frac=None, min_loss=None, max_loss=None)
                 rr=round((tp - entry_r) / max(entry_r - sl, 1e-9), 2),
                 stock_tp=round(stock_tp, 2), stock_sl=round(stock_sl, 2))
 
-# ----------------------------- LOGGING -----------------------------
 
 def log_picks(res):
     new = not os.path.exists(LOG_FILE)
@@ -649,7 +614,6 @@ def log_picks(res):
                         round(o["theta"], 3), round(o["vega"], 3), round(o["rho"], 3), round(o["iv"], 3),
                         a["score"], res.get("top") == side, " ".join(a["pa_tags"])])
 
-# ----------------------------- SCAN -----------------------------
 
 def scan_once(mode, pre_prev=None, label=None):
     now = dt.datetime.now(ET)
@@ -682,848 +646,3 @@ def scan_once(mode, pre_prev=None, label=None):
            "table": table, "scores": {a["sym"]: a["score"] for a in analysed}, "scanned": len(analysed)}
     for b in built:
         if res[b["side"]] is None or b["rank"] > res[b["side"]]["rank"]:
-            res[b["side"]] = b
-    picks = [s for s in ("CALL", "PUT") if res[s]]
-    if picks:
-        res["top"] = max(picks, key=lambda s: res[s]["rank"])
-    log_picks(res)
-    return res
-
-# ----------------------------- SCHEDULE -----------------------------
-
-def _done(state, key, today):
-    return state.get("date") == today and state.get(key) is not None
-
-
-def due_scan(now, state):
-    """The SCHEDULE entry that should start now (and has not run yet today), else None."""
-    if now.weekday() >= 5:
-        return None
-    t, today = now.time(), str(now.date())
-    for entry in SCHEDULE:
-        key, _, start, latest, _ = entry
-        if start <= t < latest and not _done(state, key, today):
-            return entry
-    return None
-
-
-def next_scan(now):
-    for i in range(8):
-        day = now.date() + dt.timedelta(days=i)
-        if day.weekday() >= 5:
-            continue
-        for entry in SCHEDULE:
-            when = dt.datetime.combine(day, entry[2], tzinfo=ET)
-            if when > now:
-                return entry, when
-    return None, None
-
-
-def pre_scores_today(state):
-    today = str(dt.datetime.now(ET).date())
-    pre = state.get("pre")
-    if state.get("date") == today and pre and pre.get("scores"):
-        return pre["scores"]
-    return None
-
-
-def run_scheduled(cfg):
-    """Runs a due scan once (state file stops repeats, also across several browser tabs)."""
-    now = dt.datetime.now(ET)
-    state = load_state()
-    entry = due_scan(now, state)
-    if not entry:
-        return None
-    key, mode, _, _, label = entry
-    today = str(now.date())
-    if state.get("date") != today:
-        state = {"date": today}
-    state[key] = {"running": True, "time": now.isoformat(timespec="seconds"), "label": label}   # claim it
-    save_state(state)
-    try:
-        res = scan_once(mode, pre_scores_today(state) if mode != "pre" else None, label)
-        state[key] = res
-        save_state(state)
-        res["telegram"] = send_telegram(cfg, telegram_text(res))
-        state[key] = res
-        save_state(state)
-    except Exception as e:
-        state[key] = {"error": str(e), "time": now.isoformat(timespec="seconds"), "mode": mode, "label": label}
-        save_state(state)
-    return key
-
-# ----------------------------- BACKTEST -----------------------------
-# yfinance only keeps 60 days of 5-minute bars and NO history of option quotes, so the backtest:
-#   1. replays every scan of the SCHEDULE on past days with the data available at that moment (no look-ahead),
-#   2. models the option: strike nearest delta 0.65, next Friday expiry, IV = 20-day HV x BT_IV_MULT, Black-Scholes,
-#   3. enters at the open of the bar after the scan (premarket scan: the 09:30 open), plus slippage,
-#   4. walks forward bar by bar: stop loss checked first (worst case) then take profit, otherwise exit 15:45 ET,
-#   5. runs the same scans twice - WITH price action and WITHOUT - so you can see what it adds.
-
-def fetch_history(symbols, progress=None):
-    """{symbol: (5-min bars incl. premarket, last 60 days ; daily bars, 6 months)}"""
-    out = {}
-
-    def one(sym):
-        # worker thread: download only - no Streamlit calls here (they fail outside the script thread)
-        try:
-            df = _clean_intraday(yf.Ticker(sym).history(period="60d", interval="5m", prepost=True))
-            dd = fetch_daily(sym, period="6mo")
-            if df is not None and dd is not None and len(df) > 200:
-                return sym, (df, dd)
-        except Exception:
-            pass
-        return sym, None
-
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        futures = [ex.submit(one, s) for s in symbols]
-        for n, fut in enumerate(as_completed(futures), 1):      # progress is reported from the main thread
-            sym, val = fut.result()
-            if val is not None:
-                out[sym] = val
-            if progress:
-                progress(n / len(symbols), f"Downloading history {n}/{len(symbols)}")
-    return out
-
-
-def _next_friday(day):
-    d = day + dt.timedelta(days=1)
-    while d.weekday() != 4:
-        d += dt.timedelta(days=1)
-    return d
-
-
-def _strike_step(S):
-    return 0.5 if S < 25 else (1.0 if S < 100 else (2.5 if S < 200 else 5.0))
-
-
-def synth_option(sym, S, side, hv, now, iv_mult, slip):
-    """Modelled option: strike with delta closest to TARGET_DELTA, next Friday expiry (never same day)."""
-    exp_day = _next_friday(now.date())
-    exp_dt = dt.datetime.combine(exp_day, MARKET_CLOSE, tzinfo=ET)
-    T = (exp_dt - now).total_seconds() / (365 * 86400)
-    iv = float(np.clip(hv * iv_mult, 0.10, 2.0))
-    step = _strike_step(S)
-    base = round(S / step) * step
-    best = None
-    for k in range(-30, 31):
-        K = base + k * step
-        if K <= 0:
-            continue
-        g = greeks(S, K, T, iv, side)
-        if g and DELTA_MIN <= abs(g["delta"]) <= DELTA_MAX:
-            dist = abs(abs(g["delta"]) - TARGET_DELTA)
-            if best is None or dist < best[0]:
-                best = (dist, K, g)
-    if best is None:
-        return None
-    _, K, g = best
-    px = bs_price(S, K, T, iv, side)
-    if px < 0.20:
-        return None
-    return dict(symbol=sym, side=side, strike=float(K), expiry=str(exp_day), exp_dt=exp_dt, T=T, iv=iv,
-                entry=px * (1 + slip), delta=g["delta"])
-
-
-def simulate_trade(opt, plan, bars, slip):
-    """Walk the 5-min bars forward. Returns (exit_option_price, reason, exit_time) or None."""
-    if bars is None or bars.empty:
-        return None
-    side, K, iv, exp_dt = opt["side"], opt["strike"], opt["iv"], opt["exp_dt"]
-    tp, sl = plan["tp"], plan["sl"]
-
-    def val(S, t_end):
-        T = max((exp_dt - t_end).total_seconds() / (365 * 86400), 1.0 / (365 * 24))
-        return bs_price(S, K, T, iv, side)
-
-    last_ts = None
-    for ts, b in zip(bars.index, bars.itertuples()):
-        t_end = ts + pd.Timedelta(minutes=5)
-        v_open = val(b.open, ts)
-        if v_open <= sl:                                       # gapped through the stop
-            return v_open * (1 - slip), "SL", ts
-        if v_open >= tp:                                       # gapped through the target
-            return v_open, "TP", ts
-        worst, best = (b.low, b.high) if side == "CALL" else (b.high, b.low)
-        if val(worst, t_end) <= sl:                            # stop first when both are inside one bar
-            return sl * (1 - slip), "SL", ts
-        if val(best, t_end) >= tp:
-            return tp, "TP", ts
-        last_ts, last_close, last_end = ts, b.close, t_end
-    return val(last_close, last_end) * (1 - slip), "TIME", last_ts
-
-
-def prepare_backtest(data, days=20, progress=None):
-    """The slow part, done once: every stock's indicator + price-action read at every scan time of the last
-    `days` trading days (cut at the scan time, so no look-ahead). run_backtest() and the sweep reuse it."""
-    if not data:
-        return []
-    today_et = dt.datetime.now(ET).date()
-    ref = max(data.values(), key=lambda x: len(x[0]))[0]
-    regr = ref[np.array([x >= MARKET_OPEN for x in ref.index.time])]
-    full = [d for d, g in regr.groupby(regr.index.date)
-            if d < today_et and len(g) >= 70 and g.index[-1].time() >= dt.time(15, 30)]
-    test_days = full[-days:]
-    prep = []
-    for di, day in enumerate(test_days):
-        exit_ts = pd.Timestamp(dt.datetime.combine(day, EXIT_TIME), tz=ET)
-        for key, mode, start, _, label in SCHEDULE:
-            when = pd.Timestamp(dt.datetime.combine(day, start), tz=ET)
-            entry_ts = max(when, pd.Timestamp(dt.datetime.combine(day, MARKET_OPEN), tz=ET))
-            base = []
-            for sym, (df, dd) in data.items():
-                i = df.index.searchsorted(when)
-                a0 = analyse_df(sym, df.iloc[max(0, i - 720):i], dd, mode)
-                if a0:
-                    base.append(a0)
-            prep.append(dict(day=day, mode=mode, label=label, entry_ts=entry_ts, exit_ts=exit_ts, base=base))
-        if progress:
-            progress((di + 1) / len(test_days), f"Reading signals, day {di + 1}/{len(test_days)} ({day})")
-    return prep
-
-
-def run_backtest(data, days=20, iv_mult=BT_IV_MULT, slip=BT_SLIPPAGE, commission=BT_COMMISSION, progress=None,
-                 prep=None, params=None, variants=None):
-    """One row per trade. params (all optional) override tp_frac, sl_frac, min_loss, max_loss, min_score, min_rr,
-    require_pa. variants = {name: use_price_action}; default compares with / without price action."""
-    p = dict(tp_frac=TP_FRAC, sl_frac=SL_MOVE_FRAC, min_loss=MIN_LOSS, max_loss=MAX_LOSS,
-             min_score=MIN_SCORE, min_rr=MIN_RR, require_pa=REQUIRE_PA, random_dir=None)
-    p.update(params or {})
-    variants = variants or {"Price action": True, "Indicators only": False}
-    if prep is None:
-        prep = prepare_backtest(data, days, progress)
-    rows, cur_day, pre_scores, taken = [], None, {}, set()
-    rnd = np.random.default_rng(p["random_dir"]) if p["random_dir"] is not None else None   # control run: coin-flip direction
-
-    for sc in prep:
-        day, mode, label, entry_ts, exit_ts = sc["day"], sc["mode"], sc["label"], sc["entry_ts"], sc["exit_ts"]
-        if day != cur_day:
-            cur_day, pre_scores, taken = day, {v: {} for v in variants}, set()
-        for vname, use_pa in variants.items():
-            fin = [finalize(a0, use_pa, pre_scores[vname] if mode != "pre" else None) for a0 in sc["base"]]
-            if mode == "pre":
-                pre_scores[vname] = {a["sym"]: a["score"] for a in fin}
-            cands = sorted([a for a in fin if abs(a["score"]) >= p["min_score"]
-                            and not (p["require_pa"] and use_pa and not pa_agrees(a))],
-                           key=lambda a: -abs(a["score"]))[:CANDIDATES]
-            best = {"CALL": None, "PUT": None}
-            for a in cands:
-                side = "CALL" if a["score"] > 0 else "PUT"
-                if rnd is not None:                                  # same stocks and exits, random direction
-                    flip = "CALL" if rnd.random() < 0.5 else "PUT"
-                    if flip != side:
-                        a = dict(a, sl_ref=None)
-                    side = flip
-                if (vname, a["sym"], side, day) in taken:
-                    continue
-                df = data[a["sym"]][0]
-                j0, j1 = df.index.searchsorted(entry_ts), df.index.searchsorted(exit_ts)
-                bars = df.iloc[j0:j1]
-                if len(bars) < 3:
-                    continue
-                S_in = float(bars.iloc[0]["open"])
-                opt = synth_option(a["sym"], S_in, side, a["hv"], entry_ts.to_pydatetime(), iv_mult, slip)
-                if not opt:
-                    continue
-                plan = trade_plan(opt, dict(a, spot=S_in), p["tp_frac"], p["sl_frac"], p["min_loss"], p["max_loss"])
-                if not plan or plan["rr"] < p["min_rr"]:
-                    continue
-                rank = abs(a["score"]) * 10 + min(plan["rr"], 3.0) * 5
-                if best[side] is None or rank > best[side]["rank"]:
-                    best[side] = dict(a=a, opt=opt, plan=plan, bars=bars, rank=rank, side=side)
-
-            for side, b in best.items():
-                if not b:
-                    continue
-                a, opt, plan = b["a"], b["opt"], b["plan"]
-                sim = simulate_trade(opt, plan, b["bars"], slip)
-                if not sim:
-                    continue
-                taken.add((vname, a["sym"], side, day))
-                px_out, reason, t_out = sim
-                pnl = (px_out - plan["entry"]) * CONTRACT_SIZE - 2 * commission
-                pa_dir = 0 if a["pa_s"] == 0 else (1 if a["pa_s"] > 0 else -1)
-                rows.append(dict(variant=vname, date=str(day), scan=label, symbol=a["sym"], side=side,
-                                 score=a["score"], strong=abs(a["score"]) >= STRONG_SCORE,
-                                 pa_points=a["pa_s"], pa_agrees=pa_dir == (1 if side == "CALL" else -1),
-                                 tags=" ".join(a["tags"]), strike=opt["strike"], expiry=opt["expiry"],
-                                 entry=plan["entry"], tp=plan["tp"], sl=plan["sl"], exit=round(px_out, 2),
-                                 reason=reason, exit_time=t_out.isoformat(), pnl=round(pnl, 2),
-                                 pnl_pct=round((px_out / plan["entry"] - 1) * 100, 1)))
-    return pd.DataFrame(rows)
-
-
-# ----- sweep: try many exit / filter settings, tune on the EARLY days, check them on the LATER days -----
-SWEEP_GRID = dict(tp_frac=[0.4, 0.7, 1.0],            # target distance (x expected move)
-                  sl_frac=[0.5, 1.0, 1.5],            # stop distance (x expected move)
-                  max_loss=[0.30, 0.50],              # option stop never wider than this share of the premium
-                  min_score=[3, 5],                   # signal strength needed
-                  mode=["Indicators only", "Price action", "PA must agree"])
-
-
-def run_sweep(data, prep, iv_mult=BT_IV_MULT, slip=BT_SLIPPAGE, commission=BT_COMMISSION, train_frac=0.6,
-              progress=None):
-    """Chronological split: the first `train_frac` of the days is for choosing, the rest only for checking.
-    A setting that wins on 'train' but loses on 'test' was just fitted to noise."""
-    days = sorted({str(s["day"]) for s in prep})
-    if len(days) < 6:
-        return pd.DataFrame()
-    split = days[max(1, int(len(days) * train_frac))]            # first test day
-    combos = list(itertools.product(SWEEP_GRID["tp_frac"], SWEEP_GRID["sl_frac"], SWEEP_GRID["max_loss"],
-                                    SWEEP_GRID["min_score"], SWEEP_GRID["mode"]))
-    out = []
-    for n, (tp, sl, ml, ms, mode) in enumerate(combos, 1):
-        params = dict(tp_frac=tp, sl_frac=sl, max_loss=ml, min_score=ms, min_rr=0.3,
-                      require_pa=(mode == "PA must agree"))
-        tr = run_backtest(data, iv_mult=iv_mult, slip=slip, commission=commission, prep=prep, params=params,
-                          variants={"v": mode != "Indicators only"})
-        if not tr.empty:
-            row = dict(mode=mode, tp_frac=tp, sl_frac=sl, max_loss=ml, min_score=ms)
-            # control: identical stocks / exits but random call-or-put (2 seeds) - the signals must beat this
-            ctrl = pd.concat([run_backtest(data, iv_mult=iv_mult, slip=slip, commission=commission, prep=prep,
-                                           params=dict(params, random_dir=sd), variants={"v": mode != "Indicators only"})
-                              for sd in (1, 2)])
-            ct = ctrl[ctrl["date"] >= split] if not ctrl.empty else ctrl
-            row["random_test_pnl$"] = round(ct["pnl"].sum() / 2, 0) if not ct.empty else 0.0
-            row["random_test_win%"] = round((ct["pnl"] > 0).mean() * 100, 1) if not ct.empty else 0.0
-            for name, part in (("train", tr[tr["date"] < split]), ("test", tr[tr["date"] >= split])):
-                s = summarize(part)
-                row[f"{name}_trades"] = s.get("Trades", 0)
-                row[f"{name}_win%"] = s.get("Win rate %", 0.0)
-                row[f"{name}_pf"] = s.get("Profit factor", 0.0)
-                row[f"{name}_pnl$"] = s.get("Total P&L $", 0.0)
-            out.append(row)
-        if progress:
-            progress(n / len(combos), f"Sweep {n}/{len(combos)}")
-    df = pd.DataFrame(out)
-    if df.empty:
-        return df
-    # strict rule (calibrated on random, zero-edge data where it passed 0-4 of 108 settings, vs ~40 when a real
-    # edge exists): profitable with PF >= 1.5 on BOTH halves, enough trades, and the test half beats the same exits
-    # with a random call/put by a wide margin (otherwise the exits - not the signals - made the money)
-    df["beats_random"] = df["test_pnl$"] > df["random_test_pnl$"] + 1.0 * df["test_pnl$"].abs()
-    df["holds_up"] = ((df["train_pnl$"] > 0) & (df["test_pnl$"] > 0) & (df["train_pf"] >= 1.5) & (df["test_pf"] >= 1.5)
-                      & (df["train_trades"] >= 30) & (df["test_trades"] >= 30) & df["beats_random"])
-    df["split_date"] = split
-    return df.sort_values("train_pf", ascending=False).reset_index(drop=True)
-
-
-def summarize(tr):
-    """Headline numbers for a set of trades (pnl in $ per 1 lot, after slippage and commission)."""
-    if tr is None or tr.empty:
-        return {}
-    tr = tr.sort_values("exit_time")
-    win, loss = tr[tr["pnl"] > 0]["pnl"], tr[tr["pnl"] <= 0]["pnl"]
-    eq = pd.concat([pd.Series([0.0]), tr["pnl"].cumsum().reset_index(drop=True)])
-    gl = abs(loss.sum())
-    return {"Trades": len(tr),
-            "Win rate %": round(len(win) / len(tr) * 100, 1),
-            "Total P&L $": round(tr["pnl"].sum(), 0),
-            "Avg P&L $": round(tr["pnl"].mean(), 1),
-            "Avg win $": round(win.mean(), 1) if len(win) else 0.0,
-            "Avg loss $": round(loss.mean(), 1) if len(loss) else 0.0,
-            "Profit factor": round(win.sum() / gl, 2) if gl > 0 else float("inf"),
-            "Max drawdown $": round((eq - eq.cummax()).min(), 0),
-            "TP hits": int((tr["reason"] == "TP").sum()),
-            "SL hits": int((tr["reason"] == "SL").sum()),
-            "Time exits": int((tr["reason"] == "TIME").sum())}
-
-
-def _breakdown(tr, col):
-    g = tr.groupby(col)["pnl"]
-    out = pd.DataFrame({"trades": g.size(), "win %": g.apply(lambda x: round((x > 0).mean() * 100, 1)),
-                        "total $": g.sum().round(0), "avg $": g.mean().round(1)})
-    return out
-
-# ----------------------------- TELEGRAM TEXT (compact) -----------------------------
-
-def telegram_text(res):
-    when = dt.datetime.fromisoformat(res["time"])
-    title = "PREMARKET (indicative)" if res["mode"] == "pre" else res.get("label", "SCAN").upper()
-    lines = [f"📊 {title} · {when.strftime('%H:%M')} ET"]
-    shown = False
-    for side in ("CALL", "PUT"):
-        it = res.get(side)
-        if not it:
-            continue
-        shown = True
-        o, p, a = it["opt"], it["plan"], it["a"]
-        star = "⭐ " if res.get("top") == side else ""
-        lines += [
-            f"{star}{'🟢' if side == 'CALL' else '🔴'} {side} {o['symbol']} {o['strike']:g} exp {o['expiry']}",
-            f"Entry {p['entry']} | SL {p['sl']} | TP {p['tp']} (+${p['profit_1lot']:.0f}/lot)",
-            f"Δ{o['delta']:.2f} Γ{o['gamma']:.3f} Θ{o['theta']:.2f} V{o['vega']:.2f} ρ{o['rho']:.2f} IV{o['iv'] * 100:.0f}%",
-            f"Stock {a['spot']:.2f} → day est {a['pred_close']:.2f} (H {a['pred_high']:.2f} / L {a['pred_low']:.2f})",
-        ]
-        lines.append(f"Chart: {tv_url(o['symbol'])}")
-        pa_txt = " ".join(t.replace("PA:", "") for t in a["pa_tags"] + (["PA:blocked"] if "PA:blocked" in a["tags"] else []))
-        if pa_txt:
-            lines.append(f"Price action: {a['pa']['struct']} | {pa_txt}")
-    if not shown:
-        lines.append("No qualifying setup this scan.")
-    return "\n".join(lines)
-
-# ----------------------------- DISPLAY -----------------------------
-
-def fmt_local(when):
-    return when.astimezone(LOCAL_TZ).strftime("%a %d %b %H:%M")
-
-
-def tv_url(sym, interval="5"):
-    """TradingView chart for the stock (5-minute by default). Yahoo's BRK-B style becomes BRK.B."""
-    return f"https://www.tradingview.com/chart/?symbol={sym.replace('-', '.')}&interval={interval}"
-
-
-# ----- Moomoo-style order ticket (dark panel, inline styles only) -----
-_BG, _FIELD, _LINE = "#1b1d22", "#2a2d34", "#3b3f48"
-_TXT, _MUT = "#e8eaed", "#8e939c"
-_GRN, _RED, _ORG, _BLU = "#2fbf71", "#ef4f5f", "#f26b21", "#2f6fed"
-
-
-def _lab(t):
-    return f'<div style="color:{_MUT};font-size:12px;margin:12px 0 4px 0">{t}</div>'
-
-
-def _box(inner, color=_TXT, align="left", extra=""):
-    return (f'<div style="background:{_FIELD};border:1px solid {_LINE};border-radius:4px;padding:8px 10px;'
-            f'color:{color};font-size:14px;text-align:{align};{extra}">{inner}</div>')
-
-
-def _stepper(value):
-    return (f'<div style="display:flex;align-items:center;background:{_FIELD};border:1px solid {_LINE};'
-            f'border-radius:4px;color:{_TXT};font-size:15px">'
-            f'<div style="padding:8px 12px;color:{_MUT}">&minus;</div>'
-            f'<div style="flex:1;text-align:center">{value}</div>'
-            f'<div style="padding:8px 12px;color:{_MUT}">+</div></div>')
-
-
-def _check(text):
-    return (f'<span style="display:inline-block;width:14px;height:14px;background:{_BLU};border-radius:2px;'
-            f'color:#fff;font-size:11px;line-height:14px;text-align:center;margin-right:6px;'
-            f'vertical-align:middle">&#10003;</span><span style="vertical-align:middle">{text}</span>')
-
-
-def _quote_bar(o, entry):
-    bid, ask = o["bid"], o["ask"]
-    live = bool(o["market_open"]) and ask > bid
-    pos = min(max((entry - bid) / (ask - bid), 0.0), 1.0) * 100 if live else 100.0
-    mid = (bid + ask) / 2 if live else o["last"]
-    f = (lambda v: f"{v:.2f}") if live else (lambda v: "--")
-    fill_left, fill_w = min(pos, 50.0), abs(pos - 50.0)
-    bar = (f'<div style="position:relative;height:14px;margin:8px 5px 4px 5px">'
-           f'<div style="position:absolute;top:6px;left:0;right:0;height:2px;background:{_LINE}"></div>'
-           f'<div style="position:absolute;top:6px;left:{fill_left}%;width:{fill_w}%;height:2px;background:{_RED}"></div>'
-           f'<div style="position:absolute;top:1px;left:calc({pos}% - 6px);width:8px;height:8px;'
-           f'border:2px solid {_RED};border-radius:50%;background:{_BG}"></div></div>')
-    labels = (f'<div style="display:flex;justify-content:space-between;color:{_MUT};font-size:12px">'
-              f'<span>Bid</span><span>Mid</span><span>Ask</span></div>'
-              f'<div style="display:flex;justify-content:space-between;color:{_TXT};font-size:13px;margin-top:2px">'
-              f'<span>{f(bid)}</span><span>{f(mid)}</span><span>{f(ask)}</span></div>')
-    return (f'<div style="background:{_FIELD};border:1px solid {_LINE};border-radius:4px;padding:8px 10px;margin-top:10px">'
-            f'{bar}{labels}</div>')
-
-
-def order_ticket_html(item):
-    """Looks like the Moomoo order ticket, filled with the scanner's values."""
-    o, p = item["opt"], item["plan"]
-    code = (o["expiry"][2:4] + o["expiry"][5:7] + o["expiry"][8:10] + f" {o['strike']:g}"
-            + ("C" if o["side"] == "CALL" else "P"))
-    entry_s, tp_s, sl_s = f"{p['entry']:.2f}", f"{p['tp']:.2f}", f"{p['sl']:.2f}"
-    gain_pct = (p["tp"] / p["entry"] - 1) * 100
-    loss_pct = (1 - p["sl"] / p["entry"]) * 100
-
-    tabs = (f'<div style="display:flex;gap:2px;margin-top:12px">'
-            f'<div style="flex:1;text-align:center;padding:7px;background:#3a3f4b;border-radius:4px 0 0 4px;'
-            f'color:{_TXT};font-size:14px">Trade</div>'
-            f'<div style="flex:1;text-align:center;padding:7px;background:{_FIELD};border-radius:0 4px 4px 0;'
-            f'color:{_MUT};font-size:14px">Ladder</div></div>')
-    contract_side = (f'<div style="display:flex;gap:10px;align-items:flex-end">'
-                     f'<div style="flex:3">{_lab("Contract")}{_box(code + "<span style=float:right>&#8964;</span>")}</div>'
-                     f'<div style="flex:1.4">{_lab("Side")}'
-                     f'{_box("Buy<span style=float:right>&#8644;</span>", color=_GRN, extra="background:#1d3a2b;")}</div></div>')
-    note_tp = f'<div style="font-size:12px;color:{_GRN};margin-top:4px">+${p["profit_1lot"]:,.0f} per lot (+{gain_pct:.0f}%)</div>'
-    note_sl = f'<div style="font-size:12px;color:{_RED};margin-top:4px">-${p["loss_1lot"]:,.0f} per lot (-{loss_pct:.0f}%)</div>'
-    amount = (f'<div style="display:flex;justify-content:space-between;margin-top:14px;font-size:14px">'
-              f'<span style="color:{_MUT}">Amount</span>'
-              f'<span style="color:{_TXT};font-weight:600">{p["cost_1lot"]:,.2f} USD(Debit)</span></div>')
-    button = (f'<div style="margin-top:12px;background:{_ORG};color:#fff;text-align:center;padding:10px;'
-              f'border-radius:4px;font-weight:600;font-size:14px">Enter these values in Moomoo</div>')
-
-    html = (
-        f'<div style="background:{_BG};border-radius:8px;padding:14px 16px;max-width:340px;'
-        f'font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:{_TXT}">'
-        f'<div style="font-size:16px;font-weight:600">Trade</div>'
-        f'<div style="font-size:12px;margin-top:2px"><a href="{tv_url(o["symbol"])}" target="_blank" rel="noopener" '
-        f'style="color:{_BLU};text-decoration:none">{o["symbol"]} - {o["side"]} - open chart in TradingView &#8599;</a></div>'
-        f'{tabs}{contract_side}'
-        f'{_lab("Session")}{_box("RTH only", color=_MUT)}'
-        f'{_lab("Order Type")}{_box("Limit<span style=float:right>&#8964;</span>")}'
-        f'{_lab("Price")}{_stepper(entry_s)}'
-        f'{_quote_bar(o, p["entry"])}'
-        f'{_lab("Contractsx100 shares")}{_stepper("1")}'
-        f'{_lab("TIF")}{_box("Day<span style=float:right>&#8964;</span>")}'
-        f'<div style="margin-top:14px;font-size:14px">{_check("Take Profit")}&nbsp;&nbsp;&nbsp;{_check("Stop Loss")}</div>'
-        f'{_lab("TP Price")}{_stepper(tp_s)}{note_tp}'
-        f'{_lab("SL Price")}{_stepper(sl_s)}{note_sl}'
-        f'{_lab("TIF")}{_box("GTC<span style=float:right>&#8964;</span>")}'
-        f'{amount}{button}</div>'
-    )
-    return html
-
-
-def draw_box(item, side, is_top):
-    icon = "🟢" if side == "CALL" else "🔴"
-    if not item:
-        with st.container(border=True):
-            st.subheader(f"{icon} {side}")
-            st.info("No qualifying contract (needs |score| >= 3, next expiry, delta 0.55-0.80, spread <= 10%, "
-                    "OI >= 100, reward:risk >= 1.3).")
-        return
-    o, p, a = item["opt"], item["plan"], item["a"]
-    with st.container(border=True):
-        st.subheader(f"{icon} {side} - {o['symbol']}" + ("   ⭐ TOP PICK" if is_top else ""))
-        link = tv_url(o["symbol"])
-        try:
-            st.link_button(f"📈 Open {o['symbol']} chart in TradingView", link)
-        except AttributeError:                                  # older Streamlit
-            st.markdown(f"[📈 Open {o['symbol']} chart in TradingView]({link})")
-        pre = f" | premarket scan score {a['pre_score']}" if a.get("pre_score") is not None else ""
-        st.caption(f"{'STRONG' if item['strong'] else 'Moderate'} signal | score {a['score']}{pre} | "
-                   f"{' '.join(a['tags'])}")
-        if not o["market_open"]:
-            st.caption("Option quotes not live (market closed / pre-open) - last price used. Confirm bid/ask before entry.")
-
-        left, right = st.columns([3, 2])
-        with left:
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.markdown("**Contract**")
-                st.write(f"Strike: **{o['strike']:g}**")
-                st.write(f"Expiry: **{o['expiry']}** ({o['dte']}d)")
-                st.write(f"Bid / Ask: {o['bid']:.2f} / {o['ask']:.2f}")
-                st.write(f"Spread: {o['spread']:.1f}%")
-                st.write(f"Vol / OI: {o['vol']} / {o['oi']}")
-            with c2:
-                st.markdown("**Greeks**")
-                st.write(f"Delta: **{o['delta']:.3f}**")
-                st.write(f"Gamma: {o['gamma']:.4f}")
-                st.write(f"Theta: {o['theta']:.3f} /day")
-                st.write(f"Vega: {o['vega']:.3f}")
-                st.write(f"Rho: {o['rho']:.3f}")
-                st.write(f"IV: {o['iv'] * 100:.1f}% (IV/HV {o['iv_ratio']:.2f})")
-            with c3:
-                st.markdown("**Stock & day prediction**")
-                st.write(f"Now: **{a['spot']:.2f}** (gap {a['gap']:+.2f}%)")
-                st.write(f"Day close est: **{a['pred_close']:.2f}**")
-                st.write(f"High / low est: {a['pred_high']:.2f} / {a['pred_low']:.2f}")
-                st.write(f"RSI {a['rsi']:.0f} | RVOL {a['rvol']:.1f}x")
-                st.write(f"Daily ATR: {a['day_atr']:.2f}")
-            pa = a["pa"]
-            room = pa["room_up"] if side == "CALL" else pa["room_dn"]
-            room_txt = f"{room:.2f} to the next {'resistance' if side == 'CALL' else 'support'}" if room is not None else "open space ahead"
-            st.write(f"**Price action:** {pa['struct']} | candle: {pa['candle']} | "
-                     f"PDH {pa['pdh']:.2f} / PDL {pa['pdl']:.2f} | {room_txt}"
-                     f"{' | BLOCKED (level too close)' if 'PA:blocked' in a['tags'] else ''}")
-            st.write(f"**Reward:Risk {p['rr']}** | stock stop {p['stock_sl']} / stock target {p['stock_tp']}")
-            st.write(f"**Take profit ${p['tp']:.2f} -> +${p['profit_1lot']:,.0f} per lot** | "
-                     f"stop loss ${p['sl']:.2f} -> -${p['loss_1lot']:,.0f} per lot")
-            st.caption("Exit: at TP or SL, early if a 5-min bar closes back through EMA15 against you, "
-                       "otherwise by 15:45 ET.")
-        with right:
-            st.markdown(order_ticket_html(item), unsafe_allow_html=True)
-
-
-def render_scan(res, empty_msg):
-    if not res:
-        st.info(empty_msg)
-        return
-    if res.get("running"):
-        st.info("Scan is running...")
-        return
-    if res.get("error"):
-        st.error(f"Scan failed: {res['error']}")
-        return
-    when = dt.datetime.fromisoformat(res["time"])
-    tg = " | Telegram sent ✅" if res.get("telegram") else ""
-    st.write(f"Scan time: **{when.strftime('%a %d %b %H:%M')} ET** ({fmt_local(when)} your time) | "
-             f"{res.get('scanned', '?')}/{len(SYMBOLS)} stocks read{tg}")
-    draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL")
-    draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT")
-    with st.expander("All stocks - direction score & day estimate"):
-        if res.get("table"):
-            st.dataframe(pd.DataFrame(res["table"]).sort_values("score", key=abs, ascending=False))
-
-
-# ----- backtest tab -----
-def show_backtest(tr):
-    if tr is None or tr.empty:
-        st.info("No trades found in that period.")
-        return
-    summ = {v: summarize(g) for v, g in tr.groupby("variant")}
-    order = [v for v in ("Price action", "Indicators only") if v in summ]
-    cols = st.columns(len(order))
-    for c, v in zip(cols, order):
-        s = summ[v]
-        with c:
-            st.markdown(f"**{v}**")
-            st.metric("Total P&L (1 lot)", f"${s['Total P&L $']:,.0f}")
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Trades", s["Trades"])
-            m2.metric("Win rate", f"{s['Win rate %']}%")
-            m3.metric("Profit factor", s["Profit factor"])
-    st.dataframe(pd.DataFrame(summ).T.loc[order])
-
-    eq = {}
-    for v in order:
-        g = tr[tr["variant"] == v].sort_values("exit_time")
-        eq[v] = g["pnl"].cumsum().reset_index(drop=True)
-    st.markdown("**Equity curve ($ per 1 lot, trade by trade)**")
-    st.line_chart(pd.DataFrame(eq))
-
-    main_v = order[0]
-    g = tr[tr["variant"] == main_v]
-    b1, b2 = st.columns(2)
-    with b1:
-        st.markdown(f"**{main_v} - by scan**")
-        st.dataframe(_breakdown(g, "scan"))
-        st.markdown(f"**{main_v} - by side**")
-        st.dataframe(_breakdown(g, "side"))
-    with b2:
-        st.markdown(f"**{main_v} - by signal strength (strong = |score| >= {STRONG_SCORE})**")
-        st.dataframe(_breakdown(g, "strong"))
-        st.markdown(f"**{main_v} - price action agreed with the trade direction**")
-        st.dataframe(_breakdown(g, "pa_agrees"))
-    with st.expander("All trades"):
-        st.dataframe(tr.sort_values(["date", "exit_time"]))
-
-
-def render_backtest_tab():
-    st.caption("Replays the scheduled scans on past days (no look-ahead) with the same scoring, trade plan and exits. "
-               "yfinance keeps only 60 days of 5-minute data and no option history, so the option is MODELLED with "
-               "Black-Scholes (strike nearest delta 0.65, next Friday expiry, IV = 20-day HV x multiplier, constant IV). "
-               "Stop loss is checked before take profit inside the same bar. Results are estimates, not a promise. "
-               "While it runs (a few minutes) the live auto-scan loop is paused.")
-    c1, c2, c3, c4 = st.columns(4)
-    days = c1.slider("Trading days", 5, 40, 20)
-    iv_mult = c2.slider("Option IV vs 20-day HV (x)", 0.8, 1.6, BT_IV_MULT, 0.05)
-    slip = c3.slider("Slippage per side (%)", 0.0, 5.0, BT_SLIPPAGE * 100, 0.5) / 100
-    comm = c4.number_input("Commission $/contract/side", 0.0, 5.0, BT_COMMISSION, 0.05)
-    nsym = st.slider("Stocks", 10, len(SYMBOLS), len(SYMBOLS), 5)
-
-    def get_prep(cb):
-        """Download + read signals once; kept for the sweep so it does not repeat the slow part."""
-        key = (days, nsym)
-        if st.session_state.get("bt_key") != key:
-            data = fetch_history(SYMBOLS[:nsym], cb)
-            if not data:
-                return None, None
-            st.session_state.update(bt_data=data, bt_prep=prepare_backtest(data, days, cb), bt_key=key)
-        return st.session_state["bt_data"], st.session_state["bt_prep"]
-
-    b1, b2 = st.columns(2)
-    if b1.button("Run backtest", type="primary"):
-        bar = st.progress(0.0, text="Starting...")
-        cb = lambda f, t: bar.progress(min(max(f, 0.0), 1.0), text=t)
-        data, prep = get_prep(cb)
-        if not data:
-            bar.empty()
-            st.error("Could not download history from yfinance.")
-        else:
-            tr = run_backtest(data, days, iv_mult, slip, comm, prep=prep)
-            bar.empty()
-            if not tr.empty:
-                tr.to_csv(BT_FILE, index=False)
-            st.session_state["bt"] = tr
-    if b2.button("Sweep settings (train on early days, test on later days)"):
-        bar = st.progress(0.0, text="Starting...")
-        cb = lambda f, t: bar.progress(min(max(f, 0.0), 1.0), text=t)
-        data, prep = get_prep(cb)
-        if not data:
-            bar.empty()
-            st.error("Could not download history from yfinance.")
-        else:
-            sw = run_sweep(data, prep, iv_mult, slip, comm, progress=cb)
-            bar.empty()
-            if not sw.empty:
-                sw.to_csv(SWEEP_FILE, index=False)
-            st.session_state["sweep"] = sw
-    tr = st.session_state.get("bt")
-    if tr is None and os.path.exists(BT_FILE):
-        tr = pd.read_csv(BT_FILE)
-        st.caption(f"Showing the last saved backtest ({BT_FILE}).")
-    if tr is not None:
-        show_backtest(tr)
-    sw = st.session_state.get("sweep")
-    if sw is None and os.path.exists(SWEEP_FILE):
-        sw = pd.read_csv(SWEEP_FILE)
-    if sw is not None:
-        show_sweep(sw)
-
-
-def show_sweep(sw):
-    st.subheader("Sweep results")
-    if sw.empty:
-        st.info("Not enough days or trades for a sweep (needs 6+ trading days).")
-        return
-    st.caption(f"Settings were ranked on the days BEFORE {sw['split_date'].iloc[0]} (train) and then checked on the "
-               "days from then on (test) - the test columns are the honest ones. 'holds_up' = profit factor 1.5+ in both "
-               "halves, 30+ trades each, and far better than the same exits with a random call/put. On random data this "
-               "rule passes 0-4 of 108 settings, so only a clearly larger count means something. A high train score that fails on test is overfitting; do not use it.")
-    good = sw[sw["holds_up"]]
-    hi = good[good["test_win%"] >= 70]
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Settings tried", len(sw))
-    c2.metric("Hold up on both halves", len(good))
-    c3.metric("...and 70%+ win rate on test", len(hi))
-    if good.empty:
-        st.warning("No setting was profitable on both the early and the later days. That is a real result: with "
-                   "this data, the signals show no edge to tune. Do not trade these scans on that basis.")
-    st.markdown("**Settings that hold up (best test profit factor first)**")
-    st.dataframe(good.sort_values("test_pf", ascending=False) if not good.empty else good)
-    with st.expander("All settings tried"):
-        st.dataframe(sw)
-    st.caption("To use a row, copy its values into TP_FRAC, SL_MOVE_FRAC, MAX_LOSS, MIN_SCORE (and REQUIRE_PA = True "
-               "for 'PA must agree'; MIN_RR to 0.3 as the sweep used) at the top of the file. Re-test on fresh days "
-               "later - 60 days of data is a small sample.")
-
-
-def cli_sweep(days):
-    print(f"Downloading history for {len(SYMBOLS)} stocks ...")
-    data = fetch_history(SYMBOLS, lambda f, t: None)
-    print(f"{len(data)} stocks. Reading signals for {days} days (slow, once) ...")
-    prep = prepare_backtest(data, days)
-    sw = run_sweep(data, prep)
-    if sw.empty:
-        print("Not enough data for a sweep.")
-        return
-    sw.to_csv(SWEEP_FILE, index=False)
-    pd.set_option("display.width", 250)
-    pd.set_option("display.max_columns", 30)
-    good = sw[sw["holds_up"]]
-    print(f"{len(sw)} settings tried, {len(good)} profitable on BOTH early (train) and later (test) days, "
-          f"{len(good[good['test_win%'] >= 70])} of those with 70%+ win rate on test.")
-    print((good if not good.empty else sw.head(10)).sort_values("test_pf", ascending=False).head(15).to_string())
-    print(f"\nAll results saved to {SWEEP_FILE}")
-
-
-def cli_backtest(days):
-    print(f"Downloading history for {len(SYMBOLS)} stocks ...")
-    data = fetch_history(SYMBOLS, lambda f, t: None)
-    print(f"{len(data)} stocks with data. Running {days}-day backtest ...")
-    tr = run_backtest(data, days)
-    if tr.empty:
-        print("No trades.")
-        return
-    tr.to_csv(BT_FILE, index=False)
-    pd.set_option("display.width", 200)
-    print(pd.DataFrame({v: summarize(g) for v, g in tr.groupby("variant")}).T.to_string())
-    for v, g in tr.groupby("variant"):
-        print(f"\n--- {v}: by scan ---")
-        print(_breakdown(g, "scan").to_string())
-    print(f"\nTrades saved to {BT_FILE}")
-
-# ----------------------------- STREAMLIT UI -----------------------------
-
-def main():
-    st.set_page_config(page_title="US Call/Put Scanner", layout="wide")
-    cfg = load_config()
-
-    st.title("📈 US Top-50 Call / Put Scanner")
-    st.caption("Scans: premarket 09:00 ET, open +10 min 09:40 ET, then every hour 10:40-14:40 ET - each one is sent to "
-               "Telegram. Next expiry (not same day) - all Greeks + price action - educational only, not advice.")
-
-    with st.sidebar:
-        auto = st.toggle("Auto scans (see schedule)", value=True)
-        with st.expander("Telegram"):
-            bot = st.text_input("Bot token", value=cfg.get("telegram_bot_token", ""), type="password")
-            chat = st.text_input("Chat ID", value=cfg.get("telegram_chat_id", ""))
-            b1, b2 = st.columns(2)
-            if b1.button("Save"):
-                cfg["telegram_bot_token"], cfg["telegram_chat_id"] = bot.strip(), chat.strip()
-                save_config(cfg)
-                st.success("Saved")
-            if b2.button("Test"):
-                st.success("Sent") if send_telegram(cfg, "✅ Scanner test message") else st.error("Not sent")
-        st.markdown("**Manual run** (screen only, no Telegram)")
-        run_pre = st.button("Premarket scan now")
-        run_open = st.button("Open scan now")
-        run_hourly = st.button("Hourly-style scan now")
-
-    if auto:
-        run_scheduled(cfg)
-
-    manual = st.session_state.setdefault("manual", {})
-    for flag, mode, label in ((run_pre, "pre", "Premarket (manual)"), (run_open, "open", "Open +10min (manual)"),
-                              (run_hourly, "hourly", "Hourly (manual)")):
-        if flag:
-            with st.spinner(f"Scanning {len(SYMBOLS)} stocks..."):
-                manual[mode] = scan_once(mode, pre_scores_today(load_state()) if mode != "pre" else None, label)
-
-    state = load_state()
-    now = dt.datetime.now(ET)
-    today = str(now.date())
-
-    def ok(r):
-        return isinstance(r, dict) and r.get("time") and not r.get("running") and not r.get("error")
-
-    def when_of(r):
-        return dt.datetime.fromisoformat(r["time"])
-
-    scheduled = {k: v for k, v in state.items() if k != "date" and ok(v)}
-    everything = list(scheduled.values()) + [r for r in manual.values() if ok(r)]
-    latest = max(everything, key=when_of) if everything else None
-
-    # today's schedule at a glance
-    marks = []
-    for key, _, start, _, label in SCHEDULE:
-        if _done(state, key, today):
-            marks.append(f"✅ {start:%H:%M}")
-        else:
-            marks.append(f"⏳ {start:%H:%M}")
-    st.caption("Today (ET): " + "  ".join(marks))
-
-    def newest(key, mode):
-        a, b = scheduled.get(key), manual.get(mode)
-        return max([x for x in (a, b) if ok(x)], key=when_of) if (ok(a) or ok(b)) else (state.get(key) or None)
-
-    t_latest, t_pre, t_open, t_hour, t_bt = st.tabs(["Latest scan", "Premarket", "Open +10min", "Hourly scans",
-                                                     "Backtest"])
-    with t_latest:
-        render_scan(latest, "No scan yet - the first one runs at 09:00 ET (or use a manual run).")
-    with t_pre:
-        render_scan(newest("pre", "pre"), "No premarket scan yet - runs at 09:00 ET.")
-    with t_open:
-        render_scan(newest("open", "open"), "No open scan yet - runs at 09:40 ET.")
-    with t_hour:
-        hourly = sorted([r for r in everything if r.get("mode") == "hourly"], key=when_of, reverse=True)
-        if hourly:
-            names = [f"{h.get('label', 'Hourly')} - {when_of(h):%a %H:%M} ET" for h in hourly]
-            pick = st.selectbox("Hourly scan", names, index=0)
-            render_scan(hourly[names.index(pick)], "")
-        else:
-            st.info("No hourly scan yet - they run at 10:40, 11:40, 12:40, 13:40 and 14:40 ET.")
-    with t_bt:
-        render_backtest_tab()
-
-    if auto:
-        box = st.empty()
-        while True:
-            now = dt.datetime.now(ET)
-            if due_scan(now, load_state()):
-                st.rerun()
-            entry, when = next_scan(now)
-            left = int((when - now).total_seconds())
-            box.caption(f"Next: **{entry[4]}** at {when.strftime('%a %H:%M')} ET ({fmt_local(when)} your time) - in "
-                        f"{left // 3600}h {(left % 3600) // 60:02d}m {left % 60:02d}s. Keep this page open.")
-            time.sleep(1)
-
-
-if __name__ == "__main__":
-    if "--sweep" in sys.argv:
-        i = sys.argv.index("--sweep")
-        cli_sweep(int(sys.argv[i + 1]) if len(sys.argv) > i + 1 and sys.argv[i + 1].isdigit() else 40)
-    elif "--backtest" in sys.argv:
-        i = sys.argv.index("--backtest")
-        cli_backtest(int(sys.argv[i + 1]) if len(sys.argv) > i + 1 and sys.argv[i + 1].isdigit() else 20)
-    else:
-        main()
