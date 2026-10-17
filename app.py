@@ -1073,6 +1073,13 @@ def run_scheduled(cfg):
         state[key] = res
         save_state(state)
         res["telegram"] = send_telegram(cfg, telegram_text(res))
+        for sd in ("CALL", "PUT"):                              # Moomoo ticket picture with the exact numbers
+            it = res.get(sd)
+            if it:
+                try:
+                    send_telegram_photo(cfg, ticket_png(it), f"{sd} {it['opt']['symbol']} - values to enter in Moomoo")
+                except Exception:
+                    pass
         state[key] = res
         save_state(state)
     except Exception as e:
@@ -1460,7 +1467,7 @@ def _metric_grid(items, quotes, ncol=5):
 
 def _list_html(items, quotes):
     """Compact list view: name | price | change | % (green up / red down; the VIX is reversed)."""
-    td = "padding:5px 6px;border-bottom:1px solid rgba(128,128,128,0.25)"
+    td = "padding:9px 8px;border-bottom:1px solid rgba(128,128,128,0.25)"
     rows = []
     for name, sym in items:
         d = quotes.get(sym)
@@ -1476,11 +1483,11 @@ def _list_html(items, quotes):
                     f'<td style="{td};text-align:right">{d["price"]:,.2f}</td>'
                     f'<td style="{td};text-align:right;color:{col}">{d["chg"]:+,.2f}</td>'
                     f'<td style="{td};text-align:right;color:{col};font-weight:600">{d["pct"]:+.2f}%</td></tr>')
-    head = ('<tr style="opacity:0.6;font-size:12px"><td style="padding:2px 6px">Name</td>'
-            '<td style="padding:2px 6px;text-align:right">Price</td>'
-            '<td style="padding:2px 6px;text-align:right">Change</td>'
-            '<td style="padding:2px 6px;text-align:right">%</td></tr>')
-    return f'<table style="width:100%;border-collapse:collapse;font-size:14px">{head}{"".join(rows)}</table>'
+    head = ('<tr style="opacity:0.6;font-size:14px"><td style="padding:2px 8px">Name</td>'
+            '<td style="padding:2px 8px;text-align:right">Price</td>'
+            '<td style="padding:2px 8px;text-align:right">Change</td>'
+            '<td style="padding:2px 8px;text-align:right">%</td></tr>')
+    return f'<table style="width:100%;border-collapse:collapse;font-size:18px">{head}{"".join(rows)}</table>'
 
 
 def render_market(box):
@@ -1490,11 +1497,13 @@ def render_market(box):
         c1, c2 = st.columns(2)
         with c1:
             with st.container(border=True):
-                st.markdown("**US indices** - price and change on the day")
+                st.markdown("### US indices")
+                st.caption("price and change on the day")
                 st.markdown(_list_html(INDICES, q), unsafe_allow_html=True)
         with c2:
             with st.container(border=True):
-                st.markdown("**Commodities** - futures, price and change on the day")
+                st.markdown("### Commodities")
+                st.caption("futures, price and change on the day")
                 st.markdown(_list_html(COMMODITIES, q), unsafe_allow_html=True)
         with st.container(border=True):
             st.markdown("**Top 10 US shares** - price and change on the day")
@@ -1598,7 +1607,159 @@ def order_ticket_html(item):
     return html
 
 
-def draw_box(item, side, is_top):
+def _pil_font(size, bold=False):
+    from PIL import ImageFont
+    names = (["arialbd.ttf", "segoeuib.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf"] if bold
+             else ["arial.ttf", "segoeui.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf"])
+    for n in names:
+        try:
+            return ImageFont.truetype(n, size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def ticket_png(item):
+    """PNG picture of the Moomoo order ticket with the exact values to type in (a replica, not a real screenshot)."""
+    from PIL import Image, ImageDraw
+    import io
+    o, p = item["opt"], item["plan"]
+    code = (o["expiry"][2:4] + o["expiry"][5:7] + o["expiry"][8:10] + f" {o['strike']:g}"
+            + ("C" if o["side"] == "CALL" else "P"))
+    W, pad = 720, 36
+    img = Image.new("RGB", (W, 1900), _BG)
+    d = ImageDraw.Draw(img)
+    f_t, f_n, f_s, f_b = _pil_font(32, True), _pil_font(27), _pil_font(21), _pil_font(27, True)
+    st_ = dict(y=pad)
+
+    def txt(x, y, s_, font, fill, anchor="lm"):
+        try:
+            d.text((x, y), s_, font=font, fill=fill, anchor=anchor)
+        except Exception:
+            d.text((x, y - 14), s_, font=font, fill=fill)
+
+    def label(s_):
+        st_["y"] += 10
+        txt(pad, st_["y"] + 12, s_, f_s, _MUT)
+        st_["y"] += 30
+
+    def box(s_, color=_TXT, fill=_FIELD, x0=pad, x1=W - pad, arrow=False, h=60, font=None):
+        y = st_["y"]
+        d.rounded_rectangle([x0, y, x1, y + h], 8, fill=fill, outline=_LINE)
+        txt(x0 + 18, y + h / 2, s_, font or f_n, color)
+        if arrow:
+            txt(x1 - 22, y + h / 2, "v", f_s, _MUT, "mm")
+        return y
+
+    def stepper(v):
+        y = st_["y"]
+        d.rounded_rectangle([pad, y, W - pad, y + 64], 8, fill=_FIELD, outline=_LINE)
+        txt(pad + 28, y + 32, "-", f_b, _MUT, "mm")
+        txt(W - pad - 28, y + 32, "+", f_b, _MUT, "mm")
+        txt(W / 2, y + 32, v, _pil_font(32, True), _TXT, "mm")
+        st_["y"] += 64
+
+    def check(x, y, s_):
+        d.rounded_rectangle([x, y, x + 28, y + 28], 4, fill=_BLU)
+        d.line([x + 7, y + 15, x + 12, y + 21, x + 22, y + 8], fill="white", width=3)
+        txt(x + 42, y + 14, s_, f_n, _TXT)
+
+    txt(pad, st_["y"] + 18, "Trade", f_t, _TXT)
+    st_["y"] += 44
+    txt(pad, st_["y"] + 10, f"{o['symbol']} - {o['side']} - values to enter", f_s, _BLU)
+    st_["y"] += 36
+    y = st_["y"]
+    d.rounded_rectangle([pad, y, W / 2 - 2, y + 48], 8, fill="#3a3f4b")
+    d.rounded_rectangle([W / 2 + 2, y, W - pad, y + 48], 8, fill=_FIELD)
+    txt(pad + (W / 2 - pad) / 2, y + 24, "Trade", f_n, _TXT, "mm")
+    txt(W / 2 + (W / 2 - pad) / 2, y + 24, "Ladder", f_n, _MUT, "mm")
+    st_["y"] += 58
+
+    st_["y"] += 10
+    txt(pad, st_["y"] + 12, "Contract", f_s, _MUT)
+    txt(490, st_["y"] + 12, "Side", f_s, _MUT)
+    st_["y"] += 30
+    y = st_["y"]
+    d.rounded_rectangle([pad, y, 470, y + 60], 8, fill=_FIELD, outline=_LINE)
+    txt(pad + 18, y + 30, code, f_b, _TXT)
+    d.rounded_rectangle([490, y, W - pad, y + 60], 8, fill="#1d3a2b", outline=_LINE)
+    txt(508, y + 30, "Buy", f_b, _GRN)
+    st_["y"] += 60
+
+    label("Session")
+    box("RTH only", _MUT)
+    st_["y"] += 60
+    label("Order Type")
+    box("Limit", arrow=True)
+    st_["y"] += 60
+    label("Price")
+    stepper(f"{p['entry']:.2f}")
+    st_["y"] += 12
+    y = st_["y"]
+    d.rounded_rectangle([pad, y, W - pad, y + 74], 8, fill=_FIELD, outline=_LINE)
+    live = bool(o["market_open"]) and o["ask"] > o["bid"]
+    mid = (o["bid"] + o["ask"]) / 2 if live else o["last"]
+    fm = (lambda v: f"{v:.2f}") if live else (lambda v: "--")
+    for x, nm, v in ((pad + 20, "Bid", o["bid"]), (W / 2 - 40, "Mid", mid), (W - pad - 110, "Ask", o["ask"])):
+        txt(x, y + 22, nm, f_s, _MUT)
+        txt(x, y + 52, fm(v), f_n, _TXT)
+    st_["y"] += 74
+    label("Contracts x100 shares")
+    stepper("1")
+    label("TIF")
+    box("Day", arrow=True)
+    st_["y"] += 60
+    st_["y"] += 22
+    check(pad, st_["y"], "Take Profit")
+    check(W / 2, st_["y"], "Stop Loss")
+    st_["y"] += 40
+    gain = (p["tp"] / p["entry"] - 1) * 100
+    loss = (1 - p["sl"] / p["entry"]) * 100
+    label("TP Price")
+    stepper(f"{p['tp']:.2f}")
+    st_["y"] += 8
+    txt(pad, st_["y"] + 12, f"+${p['profit_1lot']:,.0f} per lot (+{gain:.0f}%)", f_s, _GRN)
+    st_["y"] += 24
+    label("SL Price")
+    stepper(f"{p['sl']:.2f}")
+    st_["y"] += 8
+    txt(pad, st_["y"] + 12, f"-${p['loss_1lot']:,.0f} per lot (-{loss:.0f}%)", f_s, _RED)
+    st_["y"] += 24
+    label("TIF")
+    box("GTC", arrow=True)
+    st_["y"] += 60
+    st_["y"] += 26
+    txt(pad, st_["y"] + 14, "Amount", f_n, _MUT)
+    txt(W - pad, st_["y"] + 14, f"{p['cost_1lot']:,.2f} USD (Debit)", f_b, _TXT, "rm")
+    st_["y"] += 44
+    y = st_["y"]
+    d.rounded_rectangle([pad, y, W - pad, y + 64], 8, fill=_ORG)
+    txt(W / 2, y + 32, "Enter these values in Moomoo", f_b, "white", "mm")
+    st_["y"] += 64 + pad
+    img = img.crop((0, 0, W, st_["y"]))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def send_telegram_photo(cfg, png, caption):
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or cfg.get("telegram_bot_token")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID") or cfg.get("telegram_chat_id")
+    if not token or not chat_id:
+        return False
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendPhoto",
+                          data={"chat_id": chat_id, "caption": caption[:1000]},
+                          files={"photo": ("moomoo_ticket.png", png)}, timeout=30)
+        return r.ok
+    except Exception:
+        return False
+
+
+def draw_box(item, side, is_top, kp="x"):
     icon = "🟢" if side == "CALL" else "🔴"
     if not item:
         with st.container(border=True):
@@ -1659,10 +1820,22 @@ def draw_box(item, side, is_top):
                        "otherwise by 15:45 ET. The result of this trade is fetched automatically after the trade day "
                        "and after expiry (Learning tab).")
         with right:
-            st.markdown(order_ticket_html(item), unsafe_allow_html=True)
+            try:
+                png = ticket_png(item)
+                try:
+                    st.image(png, use_container_width=True)
+                except TypeError:                                   # older Streamlit
+                    st.image(png, use_column_width=True)
+                st.download_button("⬇ Download Moomoo ticket (PNG)", png,
+                                   file_name=f"moomoo_{o['symbol']}_{side}.png", mime="image/png",
+                                   key=f"dl_{kp}_{side}_{o['symbol']}_{o['strike']}_{p['entry']}")
+                st.caption("Replica of the Moomoo order screen with the exact values to type in - "
+                           "not a real screenshot of your account.")
+            except Exception:
+                st.markdown(order_ticket_html(item), unsafe_allow_html=True)
 
 
-def render_scan(res, empty_msg):
+def render_scan(res, empty_msg, kp="x"):
     if not res:
         st.info(empty_msg)
         return
@@ -1678,8 +1851,8 @@ def render_scan(res, empty_msg):
     st.write(f"Scan time: **{when.strftime('%a %d %b %H:%M')} ET** ({fmt_local(when)} your time) | "
              f"{res.get('scanned', '?')}/{len(SYMBOLS)} stocks read | "
              f"{MARKET_SYM} market bias: **{_bias_txt(res.get('market', 0))}**{tg}{lr}")
-    draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL")
-    draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT")
+    draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL", kp)
+    draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT", kp)
     with st.expander("All stocks - direction score & day estimate"):
         if res.get("table"):
             st.dataframe(pd.DataFrame(res["table"]).sort_values("score", key=abs, ascending=False))
@@ -1951,6 +2124,7 @@ def main():
         run_pre = st.button("Premarket scan now")
         run_open = st.button("Open-style scan now")
         run_hourly = st.button("Hourly-style scan now")
+        st.caption("The big 'Scan CALL & PUT now' button on the page works at any time of day.")
 
     refresh_weights()
 
@@ -1973,6 +2147,19 @@ def main():
         if flag:
             with st.spinner(f"Scanning {len(SYMBOLS)} stocks..."):
                 manual[mode] = scan_once(mode, pre_scores_today(load_state()) if mode != "pre" else None, label)
+
+    with top:
+        if st.button("🔎 Scan CALL & PUT now (any time of day)", type="primary", key="scan_any"):
+            n_et = dt.datetime.now(ET)
+            open_day = n_et.weekday() < 5
+            md = "pre" if (open_day and n_et.time() < MARKET_OPEN) else "hourly"
+            lbl = "Manual - premarket data" if md == "pre" else (
+                "Manual - live" if (open_day and n_et.time() < MARKET_CLOSE) else "Manual - last session data")
+            with st.spinner(f"Scanning {len(SYMBOLS)} stocks..."):
+                manual["any"] = scan_once(md, None, lbl)
+        st.caption("Works any time: during the session it uses live data; before the open it uses premarket data; "
+                   "after the close or on weekends it uses the last session's data and the latest option quotes "
+                   "(option prices may be stale - check bid/ask before ordering).")
 
     state = load_state()
     now = dt.datetime.now(ET)
@@ -2001,15 +2188,15 @@ def main():
         t_latest, t_open, t_hour, t_learn, t_bt = st.tabs(
             ["Latest scan", "Open 09:45", "Hourly scans", "Learning", "Backtest"])
         with t_latest:
-            render_scan(latest, "No scan yet - the first one runs at 09:45 ET (or use a manual run).")
+            render_scan(latest, "No scan yet - the first one runs at 09:45 ET (or press the Scan button above).", "lt")
         with t_open:
-            render_scan(newest("open", "open"), "No open scan yet - runs at 09:45 ET.")
+            render_scan(newest("open", "open"), "No open scan yet - runs at 09:45 ET.", "op")
         with t_hour:
             hourly = sorted([r for r in everything if r.get("mode") == "hourly"], key=when_of, reverse=True)
             if hourly:
                 names = [f"{h.get('label', 'Hourly')} - {when_of(h):%a %H:%M} ET" for h in hourly]
                 pick = st.selectbox("Hourly scan", names, index=0)
-                render_scan(hourly[names.index(pick)], "")
+                render_scan(hourly[names.index(pick)], "", "hr")
             else:
                 st.info("No hourly scan yet - they run at 10:45, 11:45, 12:45, 13:45 and 14:45 ET.")
         with t_learn:
