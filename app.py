@@ -1073,6 +1073,10 @@ def run_scheduled(cfg):
         state[key] = res
         save_state(state)
         res["telegram"] = send_telegram(cfg, telegram_text(res))
+        try:                                                    # second message: BUY / SELL for indices, commodities, top 10
+            send_telegram(cfg, market_signals_text())
+        except Exception:
+            pass
         for sd in ("CALL", "PUT"):                              # Moomoo ticket picture with the exact numbers
             it = res.get(sd)
             if it:
@@ -1490,25 +1494,231 @@ def _list_html(items, quotes):
     return f'<table style="width:100%;border-collapse:collapse;font-size:16px">{head}{"".join(rows)}</table>'
 
 
+# ----- BUY / SELL signals for the market panels (US indices, commodities, top-10 shares) -----
+# Supertrend + EMA 9/15 + BOS / CHoCH market structure + supply & demand zones, read from 1-hour bars.
+# "Next 1h" is an estimate (last price +/- a share of the 1-hour ATR), not a promise. Educational only.
+SIG_PERIOD, SIG_INTERVAL = "3mo", "1h"
+ST_PERIOD, ST_MULT = 10, 3.0                 # Supertrend settings
+SIG_SWING_K = 3                              # a swing high / low = extreme of 3 bars either side
+SIG_FRESH_BARS = 12                          # a CHoCH this recent counts as a fresh reversal (+1 extra point)
+SIG_ZONE_PAD = 0.3                           # a zone counts when price is inside it or within 0.3 x ATR of it
+SIG_BUY, SIG_SELL = 3, -3                    # score needed for BUY / SELL (score runs -5 ... +5), otherwise WAIT
+SIG_REFRESH_SEC = 300
+
+
+def supertrend(df, period=ST_PERIOD, mult=ST_MULT):
+    """Supertrend line and direction (+1 up / -1 down) for every bar."""
+    hl2 = ((df["high"] + df["low"]) / 2).to_numpy()
+    a = atr(df, period).to_numpy()
+    ub, lb = hl2 + mult * a, hl2 - mult * a
+    c = df["close"].to_numpy()
+    n = len(c)
+    fu, fl = ub.copy(), lb.copy()
+    d = np.ones(n, dtype=int)
+    line = np.empty(n)
+    d[0] = 1 if c[0] >= hl2[0] else -1
+    line[0] = lb[0] if d[0] == 1 else ub[0]
+    for i in range(1, n):
+        fu[i] = ub[i] if (ub[i] < fu[i - 1] or c[i - 1] > fu[i - 1]) else fu[i - 1]
+        fl[i] = lb[i] if (lb[i] > fl[i - 1] or c[i - 1] < fl[i - 1]) else fl[i - 1]
+        d[i] = d[i - 1]
+        if d[i - 1] == 1 and c[i] < fl[i]:
+            d[i] = -1
+        elif d[i - 1] == -1 and c[i] > fu[i]:
+            d[i] = 1
+        line[i] = fl[i] if d[i] == 1 else fu[i]
+    return d, line
+
+
+def structure_events(df, k=SIG_SWING_K):
+    """Walks the bars once (no look-ahead: a swing is only known k bars after it forms).
+       A close beyond the last swing high / low in the direction of the trend = BOS (break of structure).
+       A close beyond the last swing AGAINST the trend = CHoCH (change of character) and the trend flips.
+       Each break leaves a zone: bullish break -> DEMAND zone at the last swing low (wick to body top),
+       bearish break -> SUPPLY zone at the last swing high (body bottom to wick). A zone is dropped once price
+       closes through it. Returns trend, last event (kind, direction, bar index) and the open zones."""
+    hi, lo = df["high"].to_numpy(), df["low"].to_numpy()
+    op, cl = df["open"].to_numpy(), df["close"].to_numpy()
+    n = len(df)
+    trend, ev = 0, None
+    last_sh = last_sl = None
+    sh_done = sl_done = False
+    demand, supply = [], []
+    for i in range(n):
+        j = i - k
+        if j >= k:
+            w_hi, w_lo = hi[j - k:j + k + 1], lo[j - k:j + k + 1]
+            if hi[j] == w_hi.max() and (w_hi == hi[j]).sum() == 1:
+                last_sh, sh_done = (j, float(hi[j])), False
+            if lo[j] == w_lo.min() and (w_lo == lo[j]).sum() == 1:
+                last_sl, sl_done = (j, float(lo[j])), False
+        if last_sh and not sh_done and cl[i] > last_sh[1]:
+            ev = ("BOS" if trend >= 0 else "CHoCH", 1, i)
+            trend, sh_done = 1, True
+            if last_sl:
+                m = last_sl[0]
+                demand.append((float(lo[m]), float(max(op[m], cl[m])), m))
+        elif last_sl and not sl_done and cl[i] < last_sl[1]:
+            ev = ("BOS" if trend <= 0 else "CHoCH", -1, i)
+            trend, sl_done = -1, True
+            if last_sh:
+                m = last_sh[0]
+                supply.append((float(min(op[m], cl[m])), float(hi[m]), m))
+        demand = [z for z in demand if cl[i] >= z[0]][-5:]
+        supply = [z for z in supply if cl[i] <= z[1]][-5:]
+    return dict(trend=trend, ev=ev, bars_ago=(n - 1 - ev[2]) if ev else None, demand=demand, supply=supply)
+
+
+def signal_for(sym):
+    """BUY / SELL / WAIT for one symbol from its 1-hour bars (None when there is no data).
+       Score: Supertrend +-1, EMA9 vs EMA15 +-1, structure trend +-1 (+-1 more for a fresh CHoCH), price inside /
+       next to a demand zone +1 or a supply zone -1.  BUY >= +3, SELL <= -3, else WAIT; |score| >= 4 = strong."""
+    try:
+        df = yf.Ticker(sym).history(period=SIG_PERIOD, interval=SIG_INTERVAL)
+        if df is None or df.empty:
+            return None
+        df = df.rename(columns=str.lower)[["open", "high", "low", "close"]].dropna()
+        if len(df) < 60:
+            return None
+        spot = float(df["close"].iloc[-1])
+        a1 = max(float(atr(df).iloc[-1]), 1e-9)
+        d, line = supertrend(df)
+        e9, e15 = float(ema(df["close"], 9).iloc[-1]), float(ema(df["close"], 15).iloc[-1])
+        se = structure_events(df)
+
+        s, tags = 0, []
+        s += int(d[-1])
+        tags.append("ST" + ("↑" if d[-1] > 0 else "↓"))
+        s += 1 if e9 > e15 else -1
+        tags.append("EMA9" + (">" if e9 > e15 else "<") + "15")
+        ev = se["ev"]
+        if ev:
+            s += se["trend"]
+            if ev[0] == "CHoCH" and se["bars_ago"] <= SIG_FRESH_BARS:
+                s += ev[1]
+            tags.append(ev[0] + ("↑" if ev[1] > 0 else "↓"))
+        pad = SIG_ZONE_PAD * a1
+        in_dem = any(z[0] - pad <= spot <= z[1] + pad for z in se["demand"])
+        in_sup = any(z[0] - pad <= spot <= z[1] + pad for z in se["supply"])
+        if in_dem and not in_sup:
+            s += 1
+            tags.append("Demand")
+        elif in_sup and not in_dem:
+            s -= 1
+            tags.append("Supply")
+
+        label = "BUY" if s >= SIG_BUY else ("SELL" if s <= SIG_SELL else "WAIT")
+        est = spot + (1 if s > 0 else -1) * a1 * (0.3 + 0.1 * abs(s)) if label != "WAIT" else spot
+        return dict(sig=label, score=int(s), strong=abs(s) >= 4, tags=tags, spot=spot, est=float(est),
+                    st_line=float(line[-1]))
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=SIG_REFRESH_SEC, show_spinner=False)
+def market_signals(symbols):
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        return dict(zip(symbols, ex.map(signal_for, symbols)))
+
+
+def market_signals_text():
+    """Compact BUY / SELL list for the US indices, commodities and top-10 shares (second Telegram message)."""
+    groups = (("US indices", INDICES), ("Commodities", COMMODITIES), ("Top 10 US shares", [(sy, sy) for _, sy in TOP10]))
+    syms = tuple(dict.fromkeys(s for _, items in groups for _, s in items))
+    sg = market_signals(syms)
+    lines = ["📈 MARKET SIGNALS (1h: Supertrend + EMA 9/15 + BOS/CHoCH + supply/demand)"]
+    for title, items in groups:
+        lines.append(f"\n{title}")
+        for name, sym in items:
+            s = sg.get(sym)
+            if not s:
+                continue
+            vix = sym == "^VIX"
+            if s["sig"] == "WAIT":
+                lines.append(f"⚪ {name}: WAIT {s['spot']:,.2f}")
+                continue
+            up = s["sig"] == "BUY"
+            icon = "🟢" if (up != vix) else "🔴"
+            lab = ("RISK-OFF" if up else "RISK-ON") if vix else s["sig"] + ("+" if s["strong"] else "")
+            lines.append(f"{icon} {name}: {lab} {s['spot']:,.2f} → {s['est']:,.2f} ({' '.join(s['tags'])})")
+    lines.append("\nEstimates for the next hour, not advice. + = strong signal.")
+    return "\n".join(lines)[:4000]
+
+
+def _sig_badge(s, sym):
+    """Coloured BUY / SELL / WAIT label. For the VIX, 'BUY' means fear is rising, so it reads RISK-OFF (red)."""
+    if not s:
+        return '<span style="opacity:0.5">n/a</span>'
+    lab, vix = s["sig"], sym == "^VIX"
+    if lab == "WAIT":
+        bg, txt = "#6b7280", "WAIT"
+    else:
+        up = lab == "BUY"
+        bg = "#2fbf71" if (up != vix) else "#ef4f5f"
+        txt = ("RISK-OFF" if up else "RISK-ON") if vix else lab + ("+" if s["strong"] else "")
+    return (f'<span style="background:{bg};color:#fff;border-radius:4px;padding:2px 7px;font-size:12px;'
+            f'font-weight:700;white-space:nowrap">{txt}</span>')
+
+
+def _signal_list_html(items, quotes, sigs):
+    """List view: name | price | % | signal (+ the reasons in small print) | estimate for the next hour."""
+    td = "padding:7px 6px;border-bottom:1px solid rgba(128,128,128,0.25);vertical-align:top"
+    rows = []
+    for name, sym in items:
+        d, s = quotes.get(sym), sigs.get(sym)
+        if not d:
+            rows.append(f'<tr><td style="{td}">{name}</td>'
+                        f'<td colspan="4" style="{td};text-align:right;opacity:0.6">n/a</td></tr>')
+            continue
+        good = d["chg"] >= 0
+        if sym == "^VIX":
+            good = not good
+        col = "#2fbf71" if good else "#ef4f5f"
+        if s:
+            tip = f'score {s["score"]:+d} of 5 | Supertrend line {s["st_line"]:,.2f}'
+            sig_cell = (f'<div title="{tip}">{_sig_badge(s, sym)}</div>'
+                        f'<div style="font-size:11px;opacity:0.65;margin-top:2px">{" · ".join(s["tags"])}</div>')
+            est = d["price"] + (s["est"] - s["spot"])
+            pct = (est / d["price"] - 1) * 100 if d["price"] else 0.0
+            ecol = "#8e939c" if s["sig"] == "WAIT" else ("#2fbf71" if pct >= 0 else "#ef4f5f")
+            est_cell = f'{est:,.2f}<div style="font-size:11px;color:{ecol}">{pct:+.2f}%</div>'
+        else:
+            sig_cell, est_cell = '<span style="opacity:0.5">n/a</span>', ""
+        rows.append(f'<tr><td style="{td}">{name}</td>'
+                    f'<td style="{td};text-align:right">{d["price"]:,.2f}</td>'
+                    f'<td style="{td};text-align:right;color:{col};font-weight:600">{d["pct"]:+.2f}%</td>'
+                    f'<td style="{td}">{sig_cell}</td>'
+                    f'<td style="{td};text-align:right">{est_cell}</td></tr>')
+    head = ('<tr style="opacity:0.6;font-size:12px"><td style="padding:2px 6px">Name</td>'
+            '<td style="padding:2px 6px;text-align:right">Price</td>'
+            '<td style="padding:2px 6px;text-align:right">%</td>'
+            '<td style="padding:2px 6px">Signal (1h)</td>'
+            '<td style="padding:2px 6px;text-align:right">Next 1h</td></tr>')
+    return f'<table style="width:100%;border-collapse:collapse;font-size:14px">{head}{"".join(rows)}</table>'
+
+
 def render_market(idx_box, com_box, sh_box):
-    """US indices (column 2), commodities (column 3) and the top-10 shares list (bottom of column 1)."""
-    syms = tuple(s for _, s in INDICES) + tuple(s for _, s in COMMODITIES) + tuple(s for _, s in TOP10)
+    """US indices and commodities stacked in column 2 (commodities below), top-10 shares at the bottom of column 1."""
+    top10 = [(f"{n} ({sy})", sy) for n, sy in TOP10]
+    syms = tuple(dict.fromkeys([s for _, s in INDICES] + [s for _, s in COMMODITIES] + [s for _, s in TOP10]))
     q = market_quotes(syms)
-    with idx_box.container():
-        with st.container(border=True):
-            st.markdown("### US indices")
-            st.caption("price and change on the day")
-            st.markdown(_list_html(INDICES, q), unsafe_allow_html=True)
-    with com_box.container():
-        with st.container(border=True):
-            st.markdown("### Commodities")
-            st.caption("futures, price and change on the day")
-            st.markdown(_list_html(COMMODITIES, q), unsafe_allow_html=True)
-    with sh_box.container():
-        with st.container(border=True):
-            st.markdown("### Top 10 US shares")
-            st.caption("price and change on the day")
-            st.markdown(_list_html([(f"{n} ({sy})", sy) for n, sy in TOP10], q), unsafe_allow_html=True)
+    try:
+        sg = market_signals(syms)
+    except Exception:
+        sg = {}
+    cap = "BUY / SELL from Supertrend + EMA 9/15 + BOS / CHoCH + supply & demand (1-hour bars)"
+    panels = ((idx_box, "US indices", "price and change on the day - " + cap, INDICES),
+              (com_box, "Commodities", "futures, price and change on the day - " + cap, COMMODITIES),
+              (sh_box, "Top 10 US shares", "price and change on the day - " + cap, top10))
+    for box, title, caption, items in panels:
+        with box.container():
+            with st.container(border=True):
+                st.markdown(f"### {title}")
+                st.caption(caption)
+                st.markdown(_signal_list_html(items, q, sg), unsafe_allow_html=True)
+                if title == "US indices":
+                    st.caption("Score runs -5 to +5: BUY at +3 or more, SELL at -3 or less, otherwise WAIT; "
+                               "+ = strong (4-5). Next 1h = estimate, not advice. VIX: RISK-OFF = fear rising.")
 
 
 # ----- live news (Yahoo Finance via yfinance) -----
@@ -1569,28 +1779,30 @@ def _ago(when):
     return f"{m}m ago" if m < 60 else (f"{m // 60}h ago" if m < 1440 else f"{m // 1440}d ago")
 
 
+NEWS_COMMOD = [("Gold", "GC=F"), ("Silver", "SI=F"), ("Crude Oil", "CL=F"), ("Natural Gas", "NG=F"),
+               ("Copper", "HG=F")]
+
+
 def render_news(box, pick_syms):
-    """Three news lists under the three columns: call/put picks, indices, top-10 shares."""
-    groups = [("Call & put picks", tuple(pick_syms)), ("US indices", tuple(s for _, s in NEWS_INDEX)),
-              ("Top 10 US shares", tuple(s for _, s in TOP10))]
+    """Live news in the right-hand column - one tab per group: call/put picks, indices, top-10 shares, commodities."""
+    groups = [("Picks", tuple(pick_syms)), ("Indices", tuple(s for _, s in NEWS_INDEX)),
+              ("Shares", tuple(s for _, s in TOP10)), ("Commodities", tuple(s for _, s in NEWS_COMMOD))]
     with box.container():
-        st.markdown("## Live news")
-        cols = st.columns(3)
-        for c, (title, syms) in zip(cols, groups):
-            with c:
-                with st.container(border=True):
-                    st.markdown(f"**{title}**")
-                    if not syms:
-                        st.caption("No call/put pick yet - news appears after the first scan.")
-                        continue
-                    items = news_for(syms)[:8]
-                    if not items:
-                        st.caption("No headlines available right now.")
-                    for it in items:
-                        t = it["title"].replace("[", "(").replace("]", ")")
-                        tag = ", ".join(sorted(x.replace("^", "") for x in it["syms"]))[:40]
-                        st.markdown(f"[{t}]({it['url']})  \n<small>{it['src']} · {_ago(it['when'])} · {tag}</small>",
-                                    unsafe_allow_html=True)
+        st.markdown("### Live news")
+        tabs = st.tabs([g[0] for g in groups])
+        for tab, (title, syms) in zip(tabs, groups):
+            with tab:
+                if not syms:
+                    st.caption("No call/put pick yet - news appears after the first scan.")
+                    continue
+                items = news_for(syms)[:8]
+                if not items:
+                    st.caption("No headlines available right now.")
+                for it in items:
+                    t = it["title"].replace("[", "(").replace("]", ")")
+                    tag = ", ".join(sorted(x.replace("^", "") for x in it["syms"]))[:40]
+                    st.markdown(f"[{t}]({it['url']})  \n<small>{it['src']} · {_ago(it['when'])} · {tag}</small>",
+                                unsafe_allow_html=True)
 
 
 # ----- Moomoo-style order ticket (dark panel, inline styles only) -----
@@ -2213,13 +2425,14 @@ def main():
     refresh_weights()
 
     # layout: the CALL / PUT picks (and the other tabs) on TOP, the market lists below them
-    col_main, col_idx, col_com = st.columns([3.2, 1.4, 1.4])
+    col_main, col_mid, col_news = st.columns([2.7, 2.5, 1.8])
     with col_main:
         btn_area = st.container()                  # the scan button (always visible, never faded)
         top = st.empty()                           # call / put picks (and the other tabs) - one slot, replaced as a whole
-        shares_box = st.empty()                    # top 10 US shares list at the bottom of column 1
-    idx_box, com_box = col_idx.empty(), col_com.empty()
-    news_box = st.empty()                          # live news under all three columns
+        shares_box = st.empty()                    # top 10 US shares (with signals) at the bottom of column 1
+    idx_box = col_mid.empty()                      # US indices
+    com_box = col_mid.empty()                      # commodities, directly below the indices
+    news_box = col_news.empty()                    # live news - third column
     render_market(idx_box, com_box, shares_box)
 
     with btn_area:
