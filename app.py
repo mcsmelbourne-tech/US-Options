@@ -1487,27 +1487,110 @@ def _list_html(items, quotes):
             '<td style="padding:2px 8px;text-align:right">Price</td>'
             '<td style="padding:2px 8px;text-align:right">Change</td>'
             '<td style="padding:2px 8px;text-align:right">%</td></tr>')
-    return f'<table style="width:100%;border-collapse:collapse;font-size:18px">{head}{"".join(rows)}</table>'
+    return f'<table style="width:100%;border-collapse:collapse;font-size:16px">{head}{"".join(rows)}</table>'
 
 
-def render_market(box):
+def render_market(idx_box, com_box, sh_box):
+    """US indices (column 2), commodities (column 3) and the top-10 shares list (bottom of column 1)."""
     syms = tuple(s for _, s in INDICES) + tuple(s for _, s in COMMODITIES) + tuple(s for _, s in TOP10)
     q = market_quotes(syms)
-    with box.container():
-        c1, c2 = st.columns(2)
-        with c1:
-            with st.container(border=True):
-                st.markdown("### US indices")
-                st.caption("price and change on the day")
-                st.markdown(_list_html(INDICES, q), unsafe_allow_html=True)
-        with c2:
-            with st.container(border=True):
-                st.markdown("### Commodities")
-                st.caption("futures, price and change on the day")
-                st.markdown(_list_html(COMMODITIES, q), unsafe_allow_html=True)
+    with idx_box.container():
         with st.container(border=True):
-            st.markdown("**Top 10 US shares** - price and change on the day")
-            _metric_grid([(f"{n} ({s})", s) for n, s in TOP10], q)
+            st.markdown("### US indices")
+            st.caption("price and change on the day")
+            st.markdown(_list_html(INDICES, q), unsafe_allow_html=True)
+    with com_box.container():
+        with st.container(border=True):
+            st.markdown("### Commodities")
+            st.caption("futures, price and change on the day")
+            st.markdown(_list_html(COMMODITIES, q), unsafe_allow_html=True)
+    with sh_box.container():
+        with st.container(border=True):
+            st.markdown("### Top 10 US shares")
+            st.caption("price and change on the day")
+            st.markdown(_list_html([(f"{n} ({sy})", sy) for n, sy in TOP10], q), unsafe_allow_html=True)
+
+
+# ----- live news (Yahoo Finance via yfinance) -----
+NEWS_INDEX = [("S&P 500", "^GSPC"), ("Nasdaq", "^IXIC"), ("Dow", "^DJI"), ("SPY", "SPY"), ("QQQ", "QQQ")]
+NEWS_REFRESH_SEC = 300
+
+
+def _news_item(n, sym):
+    try:
+        c = n.get("content") if isinstance(n.get("content"), dict) else None
+        if c:
+            title = c.get("title")
+            url = ((c.get("canonicalUrl") or c.get("clickThroughUrl") or {}) or {}).get("url")
+            src = (c.get("provider") or {}).get("displayName")
+            raw = c.get("pubDate") or c.get("displayTime")
+            when = dt.datetime.fromisoformat(raw.replace("Z", "+00:00")) if raw else None
+        else:
+            title, url, src = n.get("title"), n.get("link"), n.get("publisher")
+            ts = n.get("providerPublishTime")
+            when = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc) if ts else None
+        if not title or not url:
+            return None
+        return dict(title=title, url=url, src=src or "", when=when, sym=sym)
+    except Exception:
+        return None
+
+
+def _news_one(sym):
+    try:
+        return [i for i in (_news_item(n, sym) for n in (yf.Ticker(sym).news or [])[:10]) if i]
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=NEWS_REFRESH_SEC, show_spinner=False)
+def news_for(symbols):
+    """Newest headlines for a group of symbols, de-duplicated, newest first."""
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        lists = list(ex.map(_news_one, symbols))
+    seen, out = {}, []
+    for items in lists:
+        for it in items:
+            if it["title"] in seen:
+                seen[it["title"]]["syms"].add(it["sym"])
+                continue
+            it["syms"] = {it["sym"]}
+            seen[it["title"]] = it
+            out.append(it)
+    floor = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    out.sort(key=lambda i: i["when"] or floor, reverse=True)
+    return out[:12]
+
+
+def _ago(when):
+    if not when:
+        return ""
+    m = int((dt.datetime.now(dt.timezone.utc) - when).total_seconds() // 60)
+    return f"{m}m ago" if m < 60 else (f"{m // 60}h ago" if m < 1440 else f"{m // 1440}d ago")
+
+
+def render_news(box, pick_syms):
+    """Three news lists under the three columns: call/put picks, indices, top-10 shares."""
+    groups = [("Call & put picks", tuple(pick_syms)), ("US indices", tuple(s for _, s in NEWS_INDEX)),
+              ("Top 10 US shares", tuple(s for _, s in TOP10))]
+    with box.container():
+        st.markdown("## Live news")
+        cols = st.columns(3)
+        for c, (title, syms) in zip(cols, groups):
+            with c:
+                with st.container(border=True):
+                    st.markdown(f"**{title}**")
+                    if not syms:
+                        st.caption("No call/put pick yet - news appears after the first scan.")
+                        continue
+                    items = news_for(syms)[:8]
+                    if not items:
+                        st.caption("No headlines available right now.")
+                    for it in items:
+                        t = it["title"].replace("[", "(").replace("]", ")")
+                        tag = ", ".join(sorted(x.replace("^", "") for x in it["syms"]))[:40]
+                        st.markdown(f"[{t}]({it['url']})  \n<small>{it['src']} · {_ago(it['when'])} · {tag}</small>",
+                                    unsafe_allow_html=True)
 
 
 # ----- Moomoo-style order ticket (dark panel, inline styles only) -----
@@ -1782,7 +1865,7 @@ def draw_box(item, side, is_top, kp="x"):
         if not o["market_open"]:
             st.caption("Option quotes not live (market closed / pre-open) - last price used. Confirm bid/ask before entry.")
 
-        left, right = st.columns([3, 2])
+        left, right = st.container(), st.container()
         with left:
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -2129,9 +2212,13 @@ def main():
     refresh_weights()
 
     # layout: the CALL / PUT picks (and the other tabs) on TOP, the market lists below them
-    top = st.container()
-    mkt_box = st.empty()
-    render_market(mkt_box)
+    col_main, col_idx, col_com = st.columns([3.2, 1.4, 1.4])
+    with col_main:
+        top = st.container()                       # call / put picks (and the other tabs)
+        shares_box = st.empty()                    # top 10 US shares list at the bottom of column 1
+    idx_box, com_box = col_idx.empty(), col_com.empty()
+    news_box = st.empty()                          # live news under all three columns
+    render_market(idx_box, com_box, shares_box)
 
     try:
         settle_pending(cfg)                      # fetch results of finished trades + re-learn (quick when nothing is due)
@@ -2205,15 +2292,28 @@ def main():
             render_backtest_tab()
         box = st.empty()
 
+    pick_syms = tuple(dict.fromkeys(latest[sd]["opt"]["symbol"] for sd in ("CALL", "PUT")
+                                    if latest and latest.get(sd)))
+    try:
+        render_news(news_box, pick_syms)
+    except Exception:
+        pass
+
     if auto:
-        last_mkt = last_settle = time.time()
+        last_mkt = last_settle = last_news = time.time()
         while True:
             now = dt.datetime.now(ET)
             if due_scan(now, load_state()):
                 st.rerun()
             if time.time() - last_mkt >= MARKET_REFRESH_SEC:          # keep the index / commodity prices fresh
-                render_market(mkt_box)
+                render_market(idx_box, com_box, shares_box)
                 last_mkt = time.time()
+            if time.time() - last_news >= NEWS_REFRESH_SEC:           # refresh the headlines
+                try:
+                    render_news(news_box, pick_syms)
+                except Exception:
+                    pass
+                last_news = time.time()
             if time.time() - last_settle >= SETTLE_EVERY_SEC:         # pick up finished trades while the page is open
                 try:
                     settle_pending(cfg)
