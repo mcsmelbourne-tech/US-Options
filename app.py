@@ -1903,19 +1903,20 @@ def draw_box(item, side, is_top, kp="x"):
                        "otherwise by 15:45 ET. The result of this trade is fetched automatically after the trade day "
                        "and after expiry (Learning tab).")
         with right:
+            code = (o["expiry"][2:4] + o["expiry"][5:7] + o["expiry"][8:10] + f" {o['strike']:g}"
+                    + ("C" if o["side"] == "CALL" else "P"))
+            st.markdown(f"**Enter in Moomoo:** `{code}` · Buy · Limit **{p['entry']:.2f}** · 1 contract · Day · "
+                        f"TP **{p['tp']:.2f}** · SL **{p['sl']:.2f}** (GTC)")
             try:
                 png = ticket_png(item)
-                try:
-                    st.image(png, use_container_width=True)
-                except TypeError:                                   # older Streamlit
-                    st.image(png, use_column_width=True)
-                st.download_button("⬇ Download Moomoo ticket (PNG)", png,
-                                   file_name=f"moomoo_{o['symbol']}_{side}.png", mime="image/png",
-                                   key=f"dl_{kp}_{side}_{o['symbol']}_{o['strike']}_{p['entry']}")
-                st.caption("Replica of the Moomoo order screen with the exact values to type in - "
-                           "not a real screenshot of your account.")
+                with st.expander("Moomoo ticket (reference)", expanded=False):
+                    st.image(png, width=260)
+                    st.download_button("⬇ Download ticket (PNG)", png,
+                                       file_name=f"moomoo_{o['symbol']}_{side}.png", mime="image/png",
+                                       key=f"dl_{kp}_{side}_{o['symbol']}_{o['strike']}_{p['entry']}")
+                    st.caption("Replica of the Moomoo order screen - not a real screenshot of your account.")
             except Exception:
-                st.markdown(order_ticket_html(item), unsafe_allow_html=True)
+                pass
 
 
 def render_scan(res, empty_msg, kp="x"):
@@ -2214,11 +2215,18 @@ def main():
     # layout: the CALL / PUT picks (and the other tabs) on TOP, the market lists below them
     col_main, col_idx, col_com = st.columns([3.2, 1.4, 1.4])
     with col_main:
-        top = st.container()                       # call / put picks (and the other tabs)
+        btn_area = st.container()                  # the scan button (always visible, never faded)
+        top = st.empty()                           # call / put picks (and the other tabs) - one slot, replaced as a whole
         shares_box = st.empty()                    # top 10 US shares list at the bottom of column 1
     idx_box, com_box = col_idx.empty(), col_com.empty()
     news_box = st.empty()                          # live news under all three columns
     render_market(idx_box, com_box, shares_box)
+
+    with btn_area:
+        scan_any = st.button("🔎 Scan CALL & PUT now (any time of day)", type="primary", key="scan_any")
+        st.caption("Works any time: live data in the session, premarket data before the open, last session's data "
+                   "after the close / weekends (option prices may then be stale - check bid/ask before ordering).")
+    top.info("⏳ Updating scans and results ...")      # replaces the old results at once instead of leaving a faded copy
 
     try:
         settle_pending(cfg)                      # fetch results of finished trades + re-learn (quick when nothing is due)
@@ -2235,18 +2243,14 @@ def main():
             with st.spinner(f"Scanning {len(SYMBOLS)} stocks..."):
                 manual[mode] = scan_once(mode, pre_scores_today(load_state()) if mode != "pre" else None, label)
 
-    with top:
-        if st.button("🔎 Scan CALL & PUT now (any time of day)", type="primary", key="scan_any"):
-            n_et = dt.datetime.now(ET)
-            open_day = n_et.weekday() < 5
-            md = "pre" if (open_day and n_et.time() < MARKET_OPEN) else "hourly"
-            lbl = "Manual - premarket data" if md == "pre" else (
-                "Manual - live" if (open_day and n_et.time() < MARKET_CLOSE) else "Manual - last session data")
-            with st.spinner(f"Scanning {len(SYMBOLS)} stocks..."):
-                manual["any"] = scan_once(md, None, lbl)
-        st.caption("Works any time: during the session it uses live data; before the open it uses premarket data; "
-                   "after the close or on weekends it uses the last session's data and the latest option quotes "
-                   "(option prices may be stale - check bid/ask before ordering).")
+    if scan_any:
+        n_et = dt.datetime.now(ET)
+        open_day = n_et.weekday() < 5
+        md = "pre" if (open_day and n_et.time() < MARKET_OPEN) else "hourly"
+        lbl = "Manual - premarket data" if md == "pre" else (
+            "Manual - live" if (open_day and n_et.time() < MARKET_CLOSE) else "Manual - last session data")
+        top.info(f"🔎 Scanning {len(SYMBOLS)} stocks - about a minute ...")
+        manual["any"] = scan_once(md, None, lbl)
 
     state = load_state()
     now = dt.datetime.now(ET)
@@ -2266,7 +2270,7 @@ def main():
         a, b = scheduled.get(key), manual.get(mode)
         return max([x for x in (a, b) if ok(x)], key=when_of) if (ok(a) or ok(b)) else (state.get(key) or None)
 
-    with top:
+    with top.container():
         marks = []
         for key, _, start, _, label in SCHEDULE:
             marks.append(f"{'✅' if _done(state, key, today) else '⏳'} {start:%H:%M}")
