@@ -640,6 +640,27 @@ def earnings_before(sym, expiry):
 
 # ----------------------------- OPTION PICKER (all Greeks) -----------------------------
 
+PICK_WHY = {}                                    # (symbol, expiry index) -> why no contract passed (shown in the top-10 box)
+
+
+def _implied_vol(price, S, K, T, side):
+    """Implied volatility from an option price (bisection on Black-Scholes); 0.0 when the price has no solution.
+       Used when yfinance's own implied vol is unusable - it often returns ~0 for stale quotes when the market is
+       closed (weekends, after hours), which used to throw every contract away."""
+    if price <= 0 or S <= 0 or K <= 0 or T <= 0:
+        return 0.0
+    lo, hi = 0.05, 3.0
+    if bs_price(S, K, T, lo, side) > price or bs_price(S, K, T, hi, side) < price:
+        return 0.0
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        if bs_price(S, K, T, mid, side) < price:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
 def pick_option(sym, spot, side, hv, nth=0):
     """Next expiry AFTER today (nth=0; nth=1 = the one after that) -> best contract by delta / gamma / theta / vega /
        spread / liquidity / IV-vs-HV."""
@@ -650,6 +671,7 @@ def pick_option(sym, spot, side, hv, nth=0):
 
         future = sorted(e for e in (t.options or []) if dt.datetime.strptime(e, "%Y-%m-%d").date() > today)
         if len(future) <= nth:
+            PICK_WHY[(sym, nth)] = "expiry not listed"
             return None
         expiry = future[nth]
 
@@ -661,8 +683,10 @@ def pick_option(sym, spot, side, hv, nth=0):
         df = (chain.calls if side == "CALL" else chain.puts).copy()
         df = df[(df["strike"] > spot * 0.90) & (df["strike"] < spot * 1.10)]
         if df.empty:
+            PICK_WHY[(sym, nth)] = "no strikes near the price"
             return None
 
+        why = dict(quote=0, iv=0, oi=0, spread=0, delta=0)      # how many contracts each filter rejected
         rows = []
         for _, o in df.iterrows():
             bid, ask = float(o.get("bid") or 0), float(o.get("ask") or 0)
@@ -677,12 +701,23 @@ def pick_option(sym, spot, side, hv, nth=0):
             elif last > 0:                              # no live quote: use last traded price
                 mid, spread, entry = last, 0.0, last
             else:
+                why["quote"] += 1
                 continue
 
-            if not (0.05 <= iv <= 3.0) or oi < MIN_OI or spread > MAX_SPREAD_PCT:
+            if not (0.05 <= iv <= 3.0):                 # yfinance IV is junk when the market is closed: solve it from the price
+                iv = _implied_vol(mid, spot, float(o["strike"]), T, side)
+                if iv == 0.0:
+                    why["iv"] += 1
+                    continue
+            if oi < MIN_OI:
+                why["oi"] += 1
+                continue
+            if spread > MAX_SPREAD_PCT:
+                why["spread"] += 1
                 continue
             g = greeks(spot, float(o["strike"]), T, iv, side)
             if not g or not (DELTA_MIN <= abs(g["delta"]) <= DELTA_MAX):
+                why["delta"] += 1
                 continue
 
             d = abs(g["delta"])
@@ -705,8 +740,14 @@ def pick_option(sym, spot, side, hv, nth=0):
                              iv=iv, iv_ratio=iv_ratio, vol=vol, oi=oi, spread=spread, market_open=market_open,
                              delta=g["delta"], gamma=g["gamma"], theta=g["theta"], vega=g["vega"], rho=g["rho"],
                              quality=quality))
-        return max(rows, key=lambda x: x["quality"]) if rows else None
-    except Exception:
+        if not rows:
+            names = dict(quote="no quote", iv="IV unusable", oi=f"OI<{MIN_OI}", spread=f"spread>{MAX_SPREAD_PCT:g}%",
+                         delta=f"delta outside {DELTA_MIN}-{DELTA_MAX}")
+            PICK_WHY[(sym, nth)] = ", ".join(f"{names[k]} x{v}" for k, v in why.items() if v) or "no contracts"
+            return None
+        return max(rows, key=lambda x: x["quality"])
+    except Exception as e:
+        PICK_WHY[(sym, nth)] = f"data error ({type(e).__name__})"
         return None
 
 
@@ -986,7 +1027,8 @@ def build_top10(analysed):
         base = dict(name=name, sym=sym, side=side, score=a["score"], exp_n=nth + 1)
         opt = pick_option(sym, a["spot"], side, a["hv"], nth)
         if not opt:
-            return dict(base, error=f"no liquid contract on the {'next' if nth == 0 else '2nd'} expiry")
+            why = PICK_WHY.get((sym, nth))
+            return dict(base, error=f"no contract passed the filters" + (f": {why}" if why else ""))
         plan = trade_plan(opt, a)
         if not plan:
             return dict(base, error="no positive reward on this contract")
@@ -2210,32 +2252,38 @@ def _exp_label(r):
 
 
 def _top10_html(rows):
-    """Compact list: share + CALL/PUT + Moomoo contract | buy limit | stop loss | take profit (with $ per lot)."""
+    """One row per share: the pick (CALL / PUT) | next expiry | 2nd expiry side by side. Each expiry cell has the Moomoo
+       contract, buy limit, stop loss and take profit (with dollars per lot)."""
     td = "padding:7px 6px;border-bottom:1px solid rgba(128,128,128,0.25);vertical-align:top"
-    out = []
+    by = {}
     for r in rows:
+        by.setdefault(r["sym"], {})[r.get("exp_n", 1)] = r
+
+    def cell(r):
+        if r is None:
+            return f'<td style="{td}"></td>'
         if r.get("error"):
-            out.append(f'<tr><td style="{td}"><b>{r["sym"]}</b></td>'
-                       f'<td colspan="3" style="{td};opacity:0.6;font-size:12px">{r["error"]}</td></tr>')
-            continue
+            return f'<td style="{td};opacity:0.6;font-size:11px">{r["error"]}</td>'
         o, p = r["opt"], r["plan"]
-        bg = "#2fbf71" if r["side"] == "CALL" else "#ef4f5f"
         flags = [f for f, on in (("weak", r["weak"]), ("low R:R", r["low_rr"]), ("earnings", r["earnings"])) if on]
         flag_txt = f'<div style="font-size:11px;color:#f2a33a">{", ".join(flags)}</div>' if flags else ""
-        out.append(
-            f'<tr><td style="{td}"><b>{r["sym"]}</b> <span style="background:{bg};color:#fff;border-radius:4px;'
-            f'padding:1px 6px;font-size:11px;font-weight:700">{r["side"]}</span>'
-            f'<div style="font-size:11px;opacity:0.7;margin-top:2px">{_moomoo_code(o)} · {_exp_label(r)}</div>{flag_txt}</td>'
-            f'<td style="{td};text-align:right"><b>{p["entry"]:.2f}</b>'
-            f'<div style="font-size:11px;opacity:0.65">cost ${p["cost_1lot"]:,.0f}</div></td>'
-            f'<td style="{td};text-align:right;color:#ef4f5f"><b>{p["sl"]:.2f}</b>'
-            f'<div style="font-size:11px">-${p["loss_1lot"]:,.0f}</div></td>'
-            f'<td style="{td};text-align:right;color:#2fbf71"><b>{p["tp"]:.2f}</b>'
-            f'<div style="font-size:11px">+${p["profit_1lot"]:,.0f}</div></td></tr>')
-    head = ('<tr style="opacity:0.6;font-size:12px"><td style="padding:2px 6px">Share / Moomoo contract</td>'
-            '<td style="padding:2px 6px;text-align:right">Buy limit</td>'
-            '<td style="padding:2px 6px;text-align:right">Stop loss</td>'
-            '<td style="padding:2px 6px;text-align:right">Take profit</td></tr>')
+        return (f'<td style="{td};font-size:12px">'
+                f'<div style="opacity:0.7">{_moomoo_code(o)}</div>'
+                f'<div>Buy <b>{p["entry"]:.2f}</b> <span style="opacity:0.6">(${p["cost_1lot"]:,.0f})</span></div>'
+                f'<div style="color:#ef4f5f">SL <b>{p["sl"]:.2f}</b> -${p["loss_1lot"]:,.0f}</div>'
+                f'<div style="color:#2fbf71">TP <b>{p["tp"]:.2f}</b> +${p["profit_1lot"]:,.0f}</div>{flag_txt}</td>')
+
+    out = []
+    for sym, d in by.items():
+        sides = [x["side"] for x in d.values() if x.get("side")]
+        badge = ""
+        if sides:
+            bg = "#2fbf71" if sides[0] == "CALL" else "#ef4f5f"
+            badge = (f'<div style="margin-top:3px"><span style="background:{bg};color:#fff;border-radius:4px;'
+                     f'padding:1px 6px;font-size:11px;font-weight:700">{sides[0]}</span></div>')
+        out.append(f'<tr><td style="{td}"><b>{sym}</b>{badge}</td>{cell(d.get(1))}{cell(d.get(2))}</tr>')
+    head = ('<tr style="opacity:0.6;font-size:12px"><td style="padding:2px 6px">Share</td>'
+            '<td style="padding:2px 6px">Next expiry</td><td style="padding:2px 6px">2nd expiry</td></tr>')
     return f'<table style="width:100%;border-collapse:collapse;font-size:14px">{head}{"".join(out)}</table>'
 
 
@@ -2253,9 +2301,10 @@ def render_top10_box(box, res):
             when = dt.datetime.fromisoformat(res["time"])
             st.caption(f"Scan {when.strftime('%a %H:%M')} ET - the next two expiries (not today's), predicted direction for each share. "
                        "Moomoo: Buy - Limit at the price shown - 1 contract - Day - tick Take Profit and Stop Loss (GTC). "
-                       "$ = per lot at stop / target.")
+                       "(brackets) = cost of 1 contract; $ next to SL / TP = loss / profit per lot at stop / target.")
             st.markdown(_top10_html(rows), unsafe_allow_html=True)
             st.caption("'weak' = low score, 'low R:R' = reward:risk under the minimum, 'earnings' = results before expiry. "
+                       "Market closed = last traded option prices, so re-check bid / ask at the open before entering. "
                        "Ticket pictures and Greeks: Top 10 options tab. Estimates, not advice.")
 
 
