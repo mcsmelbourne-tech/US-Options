@@ -969,6 +969,35 @@ def compute_learning(rows):
 
 # ----------------------------- SCAN -----------------------------
 
+def build_top10(analysed):
+    """Top 10 US shares: for each one the predicted direction (CALL if the day estimate is above the price, else PUT),
+       the best next-expiry contract (same Greeks ranking as the main scan) and its trade plan (entry, stop loss, take
+       profit). Every share gets a lean; weak signals, low reward:risk and earnings before expiry are flagged
+       instead of hidden."""
+    by = {a["sym"]: a for a in analysed}
+
+    def one(item):
+        name, sym = item
+        a = by.get(sym)
+        if not a:
+            return dict(name=name, sym=sym, error="no price data")
+        side = "CALL" if a["pred_close"] > a["spot"] else "PUT"
+        base = dict(name=name, sym=sym, side=side, score=a["score"])
+        opt = pick_option(sym, a["spot"], side, a["hv"])
+        if not opt:
+            return dict(base, error="no liquid contract on the next expiry")
+        plan = trade_plan(opt, a)
+        if not plan:
+            return dict(base, error="no positive reward on this contract")
+        return dict(base, strong=abs(a["score"]) >= STRONG_SCORE, weak=abs(a["score"]) < MIN_SCORE,
+                    low_rr=plan["rr"] < MIN_RR, earnings=earnings_before(sym, opt["expiry"]), opt=opt, plan=plan,
+                    a=dict(spot=a["spot"], pred_close=a["pred_close"], pred_high=a["pred_high"],
+                           pred_low=a["pred_low"], rsi=a["rsi"], rvol=a["rvol"], gap=a["gap"], tags=list(a["tags"])))
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        return list(ex.map(one, TOP10))
+
+
 def scan_once(mode, pre_prev=None, label=None):
     now = dt.datetime.now(ET)
     refresh_weights()
@@ -1007,6 +1036,10 @@ def scan_once(mode, pre_prev=None, label=None):
     for b in built:
         if res[b["side"]] is None or b["rank"] > res[b["side"]]["rank"]:
             res[b["side"]] = b
+    try:
+        res["top10"] = build_top10(analysed)              # CALL / PUT + Moomoo values for each of the top 10 shares
+    except Exception:
+        res["top10"] = []
     picks = [s for s in ("CALL", "PUT") if res[s]]
     if picks:
         res["top"] = max(picks, key=lambda s: res[s]["rank"])
@@ -2164,6 +2197,70 @@ def _result_table(df, col):
                          "total $/lot": grp.sum().round(0), "avg $/lot": grp.mean().round(1)})
 
 
+def _moomoo_code(o):
+    """Moomoo option code as shown on its ticket, e.g. 261030 250C."""
+    return (o["expiry"][2:4] + o["expiry"][5:7] + o["expiry"][8:10] + f" {o['strike']:g}"
+            + ("C" if o["side"] == "CALL" else "P"))
+
+
+def render_top10_options(res):
+    """Top 10 US shares: predicted CALL / PUT on the next expiry, the values to enter in Moomoo, stop and profit."""
+    st.caption("For each of the top 10 US shares: the predicted direction for the day (CALL = up, PUT = down), the "
+               "best next-expiry contract by Greeks / spread / liquidity, and the numbers to type into the Moomoo "
+               "ticket. Every share gets a pick, so check the flags: 'weak' = score below the main scan's minimum, "
+               "'low R:R' = reward:risk below the minimum, 'earnings' = results due before expiry. Estimates, not advice.")
+    if not res or res.get("running") or res.get("error"):
+        st.info("No scan yet - press the Scan button above (or wait for the 09:45 ET scan).")
+        return
+    rows = res.get("top10")
+    if not rows:
+        st.info("The latest scan has no top-10 data - run a new scan with the button above.")
+        return
+    when = dt.datetime.fromisoformat(res["time"])
+    st.write(f"From the scan at **{when.strftime('%a %d %b %H:%M')} ET** ({fmt_local(when)} your time)")
+    table = []
+    for r in rows:
+        if r.get("error"):
+            table.append({"Share": f"{r['name']} ({r['sym']})", "Pick": r.get("side", "-"), "Moomoo contract": r["error"]})
+            continue
+        o, p = r["opt"], r["plan"]
+        flags = [f for f, on in (("weak", r["weak"]), ("low R:R", r["low_rr"]), ("earnings", r["earnings"])) if on]
+        table.append({"Share": f"{r['name']} ({r['sym']})", "Pick": r["side"], "Moomoo contract": _moomoo_code(o),
+                      "Buy limit": p["entry"], "Stop loss": p["sl"], "Take profit": p["tp"],
+                      "Profit/lot $": p["profit_1lot"], "Loss/lot $": p["loss_1lot"], "R:R": p["rr"],
+                      "Score": r["score"], "Flags": ", ".join(flags)})
+    st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
+    for r in rows:
+        if r.get("error"):
+            st.warning(f"{r['name']} ({r['sym']}): {r['error']}")
+            continue
+        o, p, a = r["opt"], r["plan"], r["a"]
+        icon = "🟢" if r["side"] == "CALL" else "🔴"
+        flags = [f for f, on in (("weak signal", r["weak"]), ("low R:R", r["low_rr"]),
+                                 ("earnings before expiry", r["earnings"])) if on]
+        title = f"{icon} {r['sym']} - {r['side']} {_moomoo_code(o)} | buy {p['entry']:.2f} | SL {p['sl']:.2f} | TP {p['tp']:.2f}"
+        with st.expander(title):
+            if flags:
+                st.warning("Flags: " + ", ".join(flags))
+            st.markdown(f"**Enter in Moomoo:** `{_moomoo_code(o)}` · Buy · Limit **{p['entry']:.2f}** · 1 contract · Day · "
+                        f"TP **{p['tp']:.2f}** · SL **{p['sl']:.2f}** (GTC)")
+            st.write(f"**Take profit ${p['tp']:.2f} -> +${p['profit_1lot']:,.0f} per lot** | "
+                     f"**stop loss ${p['sl']:.2f} -> -${p['loss_1lot']:,.0f} per lot** | cost ${p['cost_1lot']:,.0f} | "
+                     f"reward:risk {p['rr']}")
+            st.write(f"Expiry **{o['expiry']}** ({o['dte']}d) | delta {o['delta']:.2f} | IV {o['iv'] * 100:.0f}% | "
+                     f"bid / ask {o['bid']:.2f} / {o['ask']:.2f} | vol / OI {o['vol']} / {o['oi']}")
+            st.write(f"Stock {a['spot']:.2f} -> day estimate {a['pred_close']:.2f} (H {a['pred_high']:.2f} / "
+                     f"L {a['pred_low']:.2f}) | stock stop {p['stock_sl']} / target {p['stock_tp']} | "
+                     f"score {r['score']} | {' '.join(a['tags'])}")
+            if not o["market_open"]:
+                st.caption("Option quotes not live (market closed) - last price used. Confirm bid/ask before entry.")
+            try:
+                st.image(ticket_png(r), width=260)
+                st.caption("Replica of the Moomoo order screen with the values to enter - not a real screenshot.")
+            except Exception:
+                pass
+
+
 def render_learning_tab(cfg):
     st.caption("Every candidate of every live scan is saved. After the trade day its plan is replayed on the real "
                "5-minute bars (stop / target / 15:45 exit, option MODELLED from the logged entry and IV). After "
@@ -2425,14 +2522,14 @@ def main():
     refresh_weights()
 
     # layout: the CALL / PUT picks (and the other tabs) on TOP, the market lists below them
-    col_main, col_mid, col_news = st.columns([2.7, 2.5, 1.8])
+    col_main, col_mid, col_news = st.columns([2.8, 2.1, 2.3])
     with col_main:
         btn_area = st.container()                  # the scan button (always visible, never faded)
         top = st.empty()                           # call / put picks (and the other tabs) - one slot, replaced as a whole
         shares_box = st.empty()                    # top 10 US shares (with signals) at the bottom of column 1
     idx_box = col_mid.empty()                      # US indices
-    com_box = col_mid.empty()                      # commodities, directly below the indices
     news_box = col_news.empty()                    # live news - third column
+    com_box = col_news.empty()                     # commodities, directly below the live news
     render_market(idx_box, com_box, shares_box)
 
     with btn_area:
@@ -2489,8 +2586,8 @@ def main():
             marks.append(f"{'✅' if _done(state, key, today) else '⏳'} {start:%H:%M}")
         st.caption("Today (ET): " + "  ".join(marks))
 
-        t_latest, t_open, t_hour, t_learn, t_bt = st.tabs(
-            ["Latest scan", "Open 09:45", "Hourly scans", "Learning", "Backtest"])
+        t_latest, t_open, t_hour, t_top10, t_learn, t_bt = st.tabs(
+            ["Latest scan", "Open 09:45", "Hourly scans", "Top 10 options", "Learning", "Backtest"])
         with t_latest:
             render_scan(latest, "No scan yet - the first one runs at 09:45 ET (or press the Scan button above).", "lt")
         with t_open:
@@ -2503,6 +2600,8 @@ def main():
                 render_scan(hourly[names.index(pick)], "", "hr")
             else:
                 st.info("No hourly scan yet - they run at 10:45, 11:45, 12:45, 13:45 and 14:45 ET.")
+        with t_top10:
+            render_top10_options(latest)
         with t_learn:
             render_learning_tab(cfg)
         with t_bt:
