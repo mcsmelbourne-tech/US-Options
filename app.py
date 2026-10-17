@@ -640,17 +640,18 @@ def earnings_before(sym, expiry):
 
 # ----------------------------- OPTION PICKER (all Greeks) -----------------------------
 
-def pick_option(sym, spot, side, hv):
-    """Next expiry AFTER today -> best contract by delta / gamma / theta / vega / spread / liquidity / IV-vs-HV."""
+def pick_option(sym, spot, side, hv, nth=0):
+    """Next expiry AFTER today (nth=0; nth=1 = the one after that) -> best contract by delta / gamma / theta / vega /
+       spread / liquidity / IV-vs-HV."""
     try:
         t = yf.Ticker(sym)
         now = dt.datetime.now(ET)
         today = now.date()
 
         future = sorted(e for e in (t.options or []) if dt.datetime.strptime(e, "%Y-%m-%d").date() > today)
-        if not future:
+        if len(future) <= nth:
             return None
-        expiry = future[0]
+        expiry = future[nth]
 
         exp_dt = dt.datetime.strptime(expiry, "%Y-%m-%d").replace(hour=16, tzinfo=ET)
         T = (exp_dt - now).total_seconds() / (365 * 86400)
@@ -977,15 +978,15 @@ def build_top10(analysed):
     by = {a["sym"]: a for a in analysed}
 
     def one(item):
-        name, sym = item
+        name, sym, nth = item
         a = by.get(sym)
         if not a:
-            return dict(name=name, sym=sym, error="no price data")
+            return dict(name=name, sym=sym, exp_n=nth + 1, error="no price data")
         side = "CALL" if a["pred_close"] > a["spot"] else "PUT"
-        base = dict(name=name, sym=sym, side=side, score=a["score"])
-        opt = pick_option(sym, a["spot"], side, a["hv"])
+        base = dict(name=name, sym=sym, side=side, score=a["score"], exp_n=nth + 1)
+        opt = pick_option(sym, a["spot"], side, a["hv"], nth)
         if not opt:
-            return dict(base, error="no liquid contract on the next expiry")
+            return dict(base, error=f"no liquid contract on the {'next' if nth == 0 else '2nd'} expiry")
         plan = trade_plan(opt, a)
         if not plan:
             return dict(base, error="no positive reward on this contract")
@@ -995,7 +996,7 @@ def build_top10(analysed):
                            pred_low=a["pred_low"], rsi=a["rsi"], rvol=a["rvol"], gap=a["gap"], tags=list(a["tags"])))
 
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        return list(ex.map(one, TOP10))
+        return list(ex.map(one, [(n, s, k) for n, s in TOP10 for k in (0, 1)]))   # next expiry and the one after
 
 
 def scan_once(mode, pre_prev=None, label=None):
@@ -2203,6 +2204,11 @@ def _moomoo_code(o):
             + ("C" if o["side"] == "CALL" else "P"))
 
 
+def _exp_label(r):
+    """'next expiry' or '2nd expiry' for a top-10 row."""
+    return "next expiry" if r.get("exp_n", 1) == 1 else "2nd expiry"
+
+
 def _top10_html(rows):
     """Compact list: share + CALL/PUT + Moomoo contract | buy limit | stop loss | take profit (with $ per lot)."""
     td = "padding:7px 6px;border-bottom:1px solid rgba(128,128,128,0.25);vertical-align:top"
@@ -2219,7 +2225,7 @@ def _top10_html(rows):
         out.append(
             f'<tr><td style="{td}"><b>{r["sym"]}</b> <span style="background:{bg};color:#fff;border-radius:4px;'
             f'padding:1px 6px;font-size:11px;font-weight:700">{r["side"]}</span>'
-            f'<div style="font-size:11px;opacity:0.7;margin-top:2px">{_moomoo_code(o)}</div>{flag_txt}</td>'
+            f'<div style="font-size:11px;opacity:0.7;margin-top:2px">{_moomoo_code(o)} · {_exp_label(r)}</div>{flag_txt}</td>'
             f'<td style="{td};text-align:right"><b>{p["entry"]:.2f}</b>'
             f'<div style="font-size:11px;opacity:0.65">cost ${p["cost_1lot"]:,.0f}</div></td>'
             f'<td style="{td};text-align:right;color:#ef4f5f"><b>{p["sl"]:.2f}</b>'
@@ -2238,14 +2244,14 @@ def render_top10_box(box, res):
        needs, the stop loss and the profit (dollars per lot at stop / target)."""
     with box.container():
         with st.container(border=True):
-            st.markdown("### Top 10 options - next expiry")
+            st.markdown("### Top 10 options - next two expiries")
             ok = isinstance(res, dict) and res.get("time") and not res.get("running") and not res.get("error")
             rows = res.get("top10") if ok else None
             if not rows:
                 st.caption("Appears after the next scan - press the Scan button or wait for the 09:45 ET scan.")
                 return
             when = dt.datetime.fromisoformat(res["time"])
-            st.caption(f"Scan {when.strftime('%a %H:%M')} ET - next expiry (not today's), predicted direction for each share. "
+            st.caption(f"Scan {when.strftime('%a %H:%M')} ET - the next two expiries (not today's), predicted direction for each share. "
                        "Moomoo: Buy - Limit at the price shown - 1 contract - Day - tick Take Profit and Stop Loss (GTC). "
                        "$ = per lot at stop / target.")
             st.markdown(_top10_html(rows), unsafe_allow_html=True)
@@ -2275,7 +2281,8 @@ def render_top10_options(res):
             continue
         o, p = r["opt"], r["plan"]
         flags = [f for f, on in (("weak", r["weak"]), ("low R:R", r["low_rr"]), ("earnings", r["earnings"])) if on]
-        table.append({"Share": f"{r['name']} ({r['sym']})", "Pick": r["side"], "Moomoo contract": _moomoo_code(o),
+        table.append({"Share": f"{r['name']} ({r['sym']})", "Pick": r["side"], "Expiry": _exp_label(r) + " " + o["expiry"],
+                      "Moomoo contract": _moomoo_code(o),
                       "Buy limit": p["entry"], "Stop loss": p["sl"], "Take profit": p["tp"],
                       "Profit/lot $": p["profit_1lot"], "Loss/lot $": p["loss_1lot"], "R:R": p["rr"],
                       "Score": r["score"], "Flags": ", ".join(flags)})
@@ -2288,7 +2295,7 @@ def render_top10_options(res):
         icon = "🟢" if r["side"] == "CALL" else "🔴"
         flags = [f for f, on in (("weak signal", r["weak"]), ("low R:R", r["low_rr"]),
                                  ("earnings before expiry", r["earnings"])) if on]
-        title = f"{icon} {r['sym']} - {r['side']} {_moomoo_code(o)} | buy {p['entry']:.2f} | SL {p['sl']:.2f} | TP {p['tp']:.2f}"
+        title = f"{icon} {r['sym']} - {r['side']} {_moomoo_code(o)} ({_exp_label(r)}) | buy {p['entry']:.2f} | SL {p['sl']:.2f} | TP {p['tp']:.2f}"
         with st.expander(title):
             if flags:
                 st.warning("Flags: " + ", ".join(flags))
