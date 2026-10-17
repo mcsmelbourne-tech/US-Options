@@ -2203,6 +2203,56 @@ def _moomoo_code(o):
             + ("C" if o["side"] == "CALL" else "P"))
 
 
+def _top10_html(rows):
+    """Compact list: share + CALL/PUT + Moomoo contract | buy limit | stop loss | take profit (with $ per lot)."""
+    td = "padding:7px 6px;border-bottom:1px solid rgba(128,128,128,0.25);vertical-align:top"
+    out = []
+    for r in rows:
+        if r.get("error"):
+            out.append(f'<tr><td style="{td}"><b>{r["sym"]}</b></td>'
+                       f'<td colspan="3" style="{td};opacity:0.6;font-size:12px">{r["error"]}</td></tr>')
+            continue
+        o, p = r["opt"], r["plan"]
+        bg = "#2fbf71" if r["side"] == "CALL" else "#ef4f5f"
+        flags = [f for f, on in (("weak", r["weak"]), ("low R:R", r["low_rr"]), ("earnings", r["earnings"])) if on]
+        flag_txt = f'<div style="font-size:11px;color:#f2a33a">{", ".join(flags)}</div>' if flags else ""
+        out.append(
+            f'<tr><td style="{td}"><b>{r["sym"]}</b> <span style="background:{bg};color:#fff;border-radius:4px;'
+            f'padding:1px 6px;font-size:11px;font-weight:700">{r["side"]}</span>'
+            f'<div style="font-size:11px;opacity:0.7;margin-top:2px">{_moomoo_code(o)}</div>{flag_txt}</td>'
+            f'<td style="{td};text-align:right"><b>{p["entry"]:.2f}</b>'
+            f'<div style="font-size:11px;opacity:0.65">cost ${p["cost_1lot"]:,.0f}</div></td>'
+            f'<td style="{td};text-align:right;color:#ef4f5f"><b>{p["sl"]:.2f}</b>'
+            f'<div style="font-size:11px">-${p["loss_1lot"]:,.0f}</div></td>'
+            f'<td style="{td};text-align:right;color:#2fbf71"><b>{p["tp"]:.2f}</b>'
+            f'<div style="font-size:11px">+${p["profit_1lot"]:,.0f}</div></td></tr>')
+    head = ('<tr style="opacity:0.6;font-size:12px"><td style="padding:2px 6px">Share / Moomoo contract</td>'
+            '<td style="padding:2px 6px;text-align:right">Buy limit</td>'
+            '<td style="padding:2px 6px;text-align:right">Stop loss</td>'
+            '<td style="padding:2px 6px;text-align:right">Take profit</td></tr>')
+    return f'<table style="width:100%;border-collapse:collapse;font-size:14px">{head}{"".join(out)}</table>'
+
+
+def render_top10_box(box, res):
+    """Box under the US indices: the next-expiry CALL / PUT for each top-10 share with the values the Moomoo ticket
+       needs, the stop loss and the profit (dollars per lot at stop / target)."""
+    with box.container():
+        with st.container(border=True):
+            st.markdown("### Top 10 options - next expiry")
+            ok = isinstance(res, dict) and res.get("time") and not res.get("running") and not res.get("error")
+            rows = res.get("top10") if ok else None
+            if not rows:
+                st.caption("Appears after the next scan - press the Scan button or wait for the 09:45 ET scan.")
+                return
+            when = dt.datetime.fromisoformat(res["time"])
+            st.caption(f"Scan {when.strftime('%a %H:%M')} ET - next expiry (not today's), predicted direction for each share. "
+                       "Moomoo: Buy - Limit at the price shown - 1 contract - Day - tick Take Profit and Stop Loss (GTC). "
+                       "$ = per lot at stop / target.")
+            st.markdown(_top10_html(rows), unsafe_allow_html=True)
+            st.caption("'weak' = low score, 'low R:R' = reward:risk under the minimum, 'earnings' = results before expiry. "
+                       "Ticket pictures and Greeks: Top 10 options tab. Estimates, not advice.")
+
+
 def render_top10_options(res):
     """Top 10 US shares: predicted CALL / PUT on the next expiry, the values to enter in Moomoo, stop and profit."""
     st.caption("For each of the top 10 US shares: the predicted direction for the day (CALL = up, PUT = down), the "
@@ -2528,6 +2578,7 @@ def main():
         top = st.empty()                           # call / put picks (and the other tabs) - one slot, replaced as a whole
         shares_box = st.empty()                    # top 10 US shares (with signals) at the bottom of column 1
     idx_box = col_mid.empty()                      # US indices
+    opt_box = col_mid.empty()                      # top-10 options (next expiry), directly below the indices
     news_box = col_news.empty()                    # live news - third column
     com_box = col_news.empty()                     # commodities, directly below the live news
     render_market(idx_box, com_box, shares_box)
@@ -2608,6 +2659,10 @@ def main():
             render_backtest_tab()
         box = st.empty()
 
+    try:
+        render_top10_box(opt_box, latest)
+    except Exception:
+        pass
     pick_syms = tuple(dict.fromkeys(latest[sd]["opt"]["symbol"] for sd in ("CALL", "PUT")
                                     if latest and latest.get(sd)))
     try:
