@@ -1,12 +1,14 @@
 """
 US Top-100 Call/Put Scanner - scheduled scans every US trading day (yfinance + Greeks + price action)
+                              + SELF-IMPROVING: every candidate is tracked and its result fetched after the trade
+                                day and after expiry; the scoring weights learn from those results.
 
   Scan 1  OPEN 09:45 ET   - first scan of the day (premarket range/gap/volume + the first 15 min of trading)
   Scan 2+ HOURLY          10:45, 11:45, 12:45, 13:45, 14:45 ET - fresh picks through the day (volume is judged
                           against the time of day; 14:45 is the last, trades exit by 15:45 ET)
 
-Top of the page: US INDICES box (S&P 500, Dow, Nasdaq, Nasdaq 100, Russell 2000, ... + SPY, QQQ, DIA, IWM)
-                 with price and daily change, and the TOP 10 US SHARES below it (price + daily change).
+Page layout: best CALL and best PUT (tabs) on TOP, then two list boxes - US INDICES and COMMODITIES -
+             then the TOP 10 US SHARES.
 
 Per stock: EMA 9 / EMA 15, RSI, MACD, volume (relative to normal), ATR, VWAP, gap
            + PRICE ACTION: swing structure (HH/HL, LH/LL), break of structure (BOS), candle patterns
@@ -20,11 +22,25 @@ Per option: Black-Scholes Greeks (delta, gamma, theta, vega, rho) from yfinance 
 Output:     best CALL and best PUT in a box (+ one TOP PICK), predicted day price (close/high/low),
             entry, stop loss, take profit, profit for 1 lot. Compact Telegram alert for each scan.
 
+SELF-IMPROVEMENT (the "Learning" tab):
+  1. Every candidate contract of every live scan (not only the 2 best) is saved to tracked_trades.json.
+  2. After the trade day ends (16:10 ET) the 5-minute bars are fetched and the plan is replayed bar by bar
+     (stop loss / take profit / 15:45 exit) -> "plan result".
+  3. After the option EXPIRES, the stock's closing price on the expiry date is fetched and the exact expiry value
+     is computed (intrinsic value) -> "expiry result" (what holding to expiry would have paid).
+  4. After each settlement the weights of the individual signals (EMA, VWAP, RSI, MACD, BOS, candles ...) are
+     re-learned from the plan results (learned.json). A signal that keeps losing gets a lower weight, one that
+     keeps winning a higher weight. Needs 25+ settled trades per signal before it changes anything.
+  Honest limits: yfinance keeps no option quote history, so the plan result is the option MODELLED with Black-Scholes
+  from the logged entry price and IV (the expiry result is exact). The sample is small at first, the weights move
+  slowly on purpose, and no scanner can guarantee profit.
+
 BACKTEST:   "Backtest" tab (or command line) replays the same scans on the last N trading days of 5-minute
             data, prices the option with Black-Scholes, walks forward bar by bar to the SL / TP / 15:45 exit,
-            and compares results WITH and WITHOUT price action.
+            and compares results WITH and WITHOUT price action. (The backtest never uses the learned weights.)
 
 Run:   streamlit run us_itm_scanner.py        (leave the page open - it fires the scans on time)
+       python us_itm_scanner.py --settle      (fetch results of finished trades + re-learn, no page needed)
        python us_itm_scanner.py --backtest 20 (backtest from the command line, 20 trading days)
        python us_itm_scanner.py --sweep 40    (settings sweep, train on early days / test on later days)
 Needs: pip install streamlit yfinance pandas numpy requests
@@ -57,6 +73,8 @@ CONFIG_FILE = "config.json"
 STATE_FILE = "scan_state.json"
 BT_FILE = "backtest_trades.csv"
 SWEEP_FILE = "backtest_sweep.csv"
+TRACK_FILE = "tracked_trades.json"           # every live candidate + its settled results
+LEARN_FILE = "learned.json"                  # learned signal weights + statistics
 
 SCAN_PRE_TIME = dt.time(9, 0)                # only used by the manual "Premarket scan now" button
 SCAN_OPEN_TIME = dt.time(9, 45)              # first scheduled scan (ET)
@@ -116,6 +134,17 @@ BT_IV_MULT = 1.10                            # assumed option IV = 20-day histor
 BT_SLIPPAGE = 0.02                           # 2% of premium lost on entry and on stop / time exits
 BT_COMMISSION = 0.65                         # $ per contract per side
 
+# self-improvement
+LEARN_ON = True                              # the sidebar toggle overrides this
+MIN_TAG_N = 25                               # a signal needs this many settled trades before its weight changes
+LEARN_STRENGTH = 0.25                        # weight = 1 + strength x t-stat (t = +-2 -> 1.5 / 0.5), clipped below
+W_MIN, W_MAX = 0.0, 1.5                      # a signal can be switched off (0) or boosted by at most 50%
+SETTLE_AFTER = dt.time(16, 10)               # plan result is fetched after this time on the trade day (ET)
+EXPIRY_SETTLE_AFTER = dt.time(16, 30)        # expiry result is fetched after this time on the expiry day (ET)
+MAX_BAR_AGE_DAYS = 58                        # yfinance keeps ~60 days of 5-minute bars
+LEARNED_W = {}                               # {signal name: weight}, filled by refresh_weights()
+SETTLE_EVERY_SEC = 1800                      # while the page is open, look for finished trades this often
+
 WORKERS = 8                                  # parallel downloads
 
 SYMBOLS = [
@@ -142,12 +171,16 @@ SYMBOLS = [
     "VRTX", "REGN", "PGR", "CB", "KLAC",
 ]
 
-# ----- market panels (top of the page) -----
+# ----- market panels -----
 INDICES = [
     ("S&P 500", "^GSPC"), ("Dow Jones", "^DJI"), ("Nasdaq Composite", "^IXIC"), ("Nasdaq 100", "^NDX"),
     ("Russell 2000", "^RUT"), ("S&P MidCap 400", "^MID"), ("NYSE Composite", "^NYA"), ("Semiconductors SOX", "^SOX"),
     ("VIX (fear index)", "^VIX"), ("SPY - S&P 500 ETF", "SPY"), ("QQQ - Nasdaq 100 ETF", "QQQ"),
     ("DIA - Dow ETF", "DIA"), ("IWM - Russell 2000 ETF", "IWM"),
+]
+COMMODITIES = [
+    ("Gold", "GC=F"), ("Silver", "SI=F"), ("Crude Oil WTI", "CL=F"), ("Brent Crude", "BZ=F"),
+    ("Natural Gas", "NG=F"), ("Copper", "HG=F"), ("Platinum", "PL=F"), ("Palladium", "PA=F"),
 ]
 TOP10 = [("Apple", "AAPL"), ("Microsoft", "MSFT"), ("Nvidia", "NVDA"), ("Alphabet", "GOOGL"), ("Amazon", "AMZN"),
          ("Meta", "META"), ("Broadcom", "AVGO"), ("Tesla", "TSLA"), ("Berkshire B", "BRK-B"), ("Eli Lilly", "LLY")]
@@ -500,16 +533,31 @@ def mkt_dir(a0):
     return 1 if s >= 2 else (-1 if s <= -2 else 0)
 
 
-def finalize(a, use_pa=True, pre_prev=None, mkt=0):
+def _tag_parts(t):
+    """'+EMA9/15' -> (1, 'EMA9/15'); '-PA:BOS-down' -> (-1, 'PA:BOS-down'); 'PA:blocked' -> (0, 'PA:blocked')."""
+    if t and t[0] in "+-":
+        return (1 if t[0] == "+" else -1), t[1:]
+    return 0, t
+
+
+def finalize(a, use_pa=True, pre_prev=None, mkt=0, learn=False):
     """Final score, day prediction and stop reference. use_pa=False gives the original indicator-only score
-    (used by the backtest to compare). mkt = market bias from mkt_dir()."""
+    (used by the backtest to compare). mkt = market bias from mkt_dir(). learn=True multiplies every signal by
+    its learned weight (live scans only - the backtest keeps all weights at 1)."""
     a = dict(a)
     sym = a["sym"]
-    s, tags = a["s_core"], list(a["tags_core"])
+    W = LEARNED_W if learn else {}
+    tags = list(a["tags_core"])
+
+    def tval(t):
+        sg, name = _tag_parts(t)
+        return sg * W.get(name, 1.0)
+
+    s = sum(tval(t) for t in tags) if W else a["s_core"]
 
     def add(v, tag):
         nonlocal s
-        s += v
+        s += v * W.get(tag, 1.0)
         if v:
             tags.append(("+" if v > 0 else "-") + tag)
 
@@ -522,7 +570,7 @@ def finalize(a, use_pa=True, pre_prev=None, mkt=0):
         add((1 if s > 0 else -1) * (1 if (mkt > 0) == (s > 0) else -1), "Mkt")
     add(*a["ob"])
     if use_pa:
-        s += a["pa_s"]
+        s += sum(tval(t) for t in a["pa_tags"]) if W else a["pa_s"]
         tags += a["pa_tags"]
 
     def predict(score):
@@ -539,7 +587,7 @@ def finalize(a, use_pa=True, pre_prev=None, mkt=0):
 
     spot = a["spot"]
     pred_close = spot + sign * move
-    a.update(score=int(s), tags=tags, move=float(move),
+    a.update(score=(round(float(s), 2) if W else int(s)), tags=tags, move=float(move),
              pred_close=float(pred_close),
              pred_high=float(max(spot, pred_close) + 0.25 * a["day_atr"]),
              pred_low=float(min(spot, pred_close) - 0.25 * a["day_atr"]),
@@ -555,10 +603,10 @@ def pa_agrees(a):
 
 
 def analyse(sym, mode, pre_prev, mkt=0):
-    """Live analysis (current data) with price action on."""
+    """Live analysis (current data) with price action on and the learned weights applied."""
     try:
         base = analyse_df(sym, fetch_intraday(sym), fetch_daily(sym), mode)
-        return finalize(base, True, pre_prev, mkt) if base else None
+        return finalize(base, True, pre_prev, mkt, learn=True) if base else None
     except Exception:
         return None
 
@@ -721,10 +769,209 @@ def log_picks(res):
                         round(o["theta"], 3), round(o["vega"], 3), round(o["rho"], 3), round(o["iv"], 3),
                         a["score"], res.get("top") == side, " ".join(a["pa_tags"])])
 
+# ----------------------------- SELF-IMPROVEMENT: TRACK -> SETTLE -> LEARN -----------------------------
+
+def load_tracker():
+    d = _load_json(TRACK_FILE)
+    return d if isinstance(d, list) else []
+
+
+def save_tracker(rows):
+    _save_json(TRACK_FILE, rows)
+
+
+def refresh_weights():
+    """Load the learned signal weights (empty = all 1.0 when self-learning is off or nothing learned yet)."""
+    global LEARNED_W
+    d = _load_json(LEARN_FILE)
+    LEARNED_W = dict(d.get("weights", {})) if (LEARN_ON and isinstance(d, dict)) else {}
+    return LEARNED_W
+
+
+def record_trades(built, res, now):
+    """Save every candidate contract of a live scan (not just the 2 best) so its result can be fetched later."""
+    if res["mode"] == "pre" or now.weekday() >= 5 or not (MARKET_OPEN <= now.time() < EXIT_TIME):
+        return 0
+    rows = load_tracker()
+    have = {r["id"] for r in rows}
+    n = 0
+    for b in built:
+        o, p, a = b["opt"], b["plan"], b["a"]
+        rid = f"{res['time']}|{o['symbol']}|{b['side']}"
+        if rid in have:
+            continue
+        picked = res.get(b["side"]) is b
+        rows.append(dict(
+            id=rid, time=res["time"], date=str(now.date()), scan=res["label"], mode=res["mode"],
+            sym=o["symbol"], side=b["side"], picked=bool(picked), top=bool(picked and res.get("top") == b["side"]),
+            strike=float(o["strike"]), expiry=o["expiry"], T=float(o["T"]), iv=float(o["iv"]),
+            entry=float(p["entry"]), sl=float(p["sl"]), tp=float(p["tp"]), spot=float(a["spot"]),
+            score=float(a["score"]), tags=list(a["tags"]), pa_s=int(a["pa_s"]), rr=float(p["rr"]),
+            delta=float(o["delta"]),
+            plan_pnl=None, plan_reason=None, plan_exit=None, plan_time=None,
+            expiry_close=None, expiry_value=None, expiry_pnl=None))
+        n += 1
+    if n:
+        save_tracker(rows)
+    return n
+
+
+def _prefetch(symbols, fn):
+    out = {}
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs = {ex.submit(fn, s): s for s in symbols}
+        for f in as_completed(futs):
+            try:
+                out[futs[f]] = f.result()
+            except Exception:
+                out[futs[f]] = None
+    return out
+
+
+def _fetch_bars_60d(sym):
+    return _clean_intraday(yf.Ticker(sym).history(period="60d", interval="5m", prepost=True))
+
+
+def settle_pending(cfg=None):
+    """Fetch the results of finished trades.
+       Stage 1 (after the trade day): replay the plan on the 5-minute bars -> plan_pnl (stop / target / 15:45 exit).
+       Stage 2 (after expiry): the stock's close on the expiry date -> exact intrinsic value -> expiry_pnl.
+       Then the signal weights are re-learned. Returns the number of trades that got a new result."""
+    rows = load_tracker()
+    if not rows:
+        return 0
+    now = dt.datetime.now(ET)
+
+    def plan_due(r):
+        return (r.get("plan_pnl") is None and not r.get("plan_skip")
+                and now >= dt.datetime.combine(dt.date.fromisoformat(r["date"]), SETTLE_AFTER, tzinfo=ET))
+
+    def exp_due(r):
+        if r.get("expiry_pnl") is not None or r.get("exp_skip"):
+            return False
+        e = dt.date.fromisoformat(r["expiry"])
+        return e < now.date() or (e == now.date() and now.time() >= EXPIRY_SETTLE_AFTER)
+
+    need_bars = sorted({r["sym"] for r in rows if plan_due(r)})
+    need_daily = sorted({r["sym"] for r in rows if exp_due(r)})
+    if not need_bars and not need_daily:
+        return 0
+    bars = _prefetch(need_bars, _fetch_bars_60d)
+    daily = _prefetch(need_daily, lambda s: fetch_daily(s, "6mo"))
+
+    new_plan, new_exp = [], []
+    for r in rows:
+        day = dt.date.fromisoformat(r["date"])
+        exp = dt.date.fromisoformat(r["expiry"])
+        if plan_due(r):
+            df = bars.get(r["sym"])
+            age = (now.date() - day).days
+            res_bars = None
+            if df is not None:
+                t0 = pd.Timestamp(r["time"]).tz_convert(ET)
+                exit_ts = pd.Timestamp(dt.datetime.combine(day, EXIT_TIME), tz=ET)
+                j0, j1 = df.index.searchsorted(t0), df.index.searchsorted(exit_ts)
+                res_bars = df.iloc[j0:j1]
+            if res_bars is not None and len(res_bars) >= 3:
+                opt = dict(side=r["side"], strike=r["strike"], iv=r["iv"],
+                           exp_dt=dt.datetime.combine(exp, MARKET_CLOSE, tzinfo=ET))
+                # the logged entry is the real ask; shift the Black-Scholes curve so it starts exactly there
+                offset = r["entry"] - bs_price(r["spot"], r["strike"], r["T"], r["iv"], r["side"])
+                sim = simulate_trade(opt, dict(tp=r["tp"], sl=r["sl"]), res_bars, BT_SLIPPAGE, offset)
+                if sim:
+                    px, reason, ts = sim
+                    r.update(plan_pnl=round((px - r["entry"]) * CONTRACT_SIZE - 2 * BT_COMMISSION, 2),
+                             plan_reason=reason, plan_exit=round(float(px), 2), plan_time=ts.isoformat())
+                    new_plan.append(r)
+            elif age > 5 or (df is not None and age > MAX_BAR_AGE_DAYS):
+                r["plan_skip"] = True                          # no bars available any more
+        if exp_due(r):
+            dd = daily.get(r["sym"])
+            if dd is not None:
+                m = dd[np.array([x == exp for x in dd.index.date])]
+                if len(m):
+                    close = float(m["close"].iloc[0])
+                    val = max(close - r["strike"], 0.0) if r["side"] == "CALL" else max(r["strike"] - close, 0.0)
+                    r.update(expiry_close=round(close, 2), expiry_value=round(val, 2),
+                             expiry_pnl=round((val - r["entry"]) * CONTRACT_SIZE - BT_COMMISSION, 2))
+                    new_exp.append(r)
+                elif (now.date() - exp).days > 6:
+                    r["exp_skip"] = True
+            elif (now.date() - exp).days > 6:
+                r["exp_skip"] = True
+
+    save_tracker(rows)
+    compute_learning(rows)
+    refresh_weights()
+    if cfg is not None and (new_plan or new_exp):
+        send_telegram(cfg, settle_text(new_plan, new_exp))
+    return len(new_plan) + len(new_exp)
+
+
+def settle_text(new_plan, new_exp):
+    lines = ["📒 RESULTS UPDATE"]
+    if new_plan:
+        w = sum(1 for r in new_plan if r["plan_pnl"] > 0)
+        lines.append(f"Trade day: {len(new_plan)} settled, {w} won, P&L ${sum(r['plan_pnl'] for r in new_plan):+,.0f}/lot")
+    if new_exp:
+        w = sum(1 for r in new_exp if r["expiry_pnl"] > 0)
+        lines.append(f"Expired: {len(new_exp)} settled, {w} in profit at expiry, "
+                     f"${sum(r['expiry_pnl'] for r in new_exp):+,.0f}/lot")
+    return "\n".join(lines)
+
+
+def compute_learning(rows):
+    """Re-learn the weight of every signal from the plan results. One trade per (day, stock, side) is used so
+    the same setup repeated in several hourly scans is not counted many times. A signal's weight is
+    1 + LEARN_STRENGTH x t-stat of (its aligned trades' P&L vs all other trades), clipped to W_MIN..W_MAX, and only
+    changes after MIN_TAG_N settled trades - small samples leave the weight at 1.0."""
+    out = dict(updated=dt.datetime.now(ET).isoformat(timespec="seconds"), trades=0, weights={}, tags=[],
+               by_side={}, by_scan={})
+    done = [r for r in rows if r.get("plan_pnl") is not None]
+    if done:
+        df = (pd.DataFrame(done).sort_values("time").drop_duplicates(["date", "sym", "side"], keep="first")
+              .reset_index(drop=True))
+        pnl = df["plan_pnl"].astype(float).to_numpy()
+        sg = df["side"].map({"CALL": 1, "PUT": -1}).to_numpy()
+        aligned = []
+        for tags, s in zip(df["tags"], sg):
+            al = set()
+            for t in tags:
+                sign, name = _tag_parts(t)
+                if sign and sign == s:
+                    al.add(name)
+            aligned.append(al)
+        names = sorted(set().union(*aligned)) if aligned else []
+        for name in names:
+            m = np.array([name in al for al in aligned])
+            n_in, n_out = int(m.sum()), int((~m).sum())
+            p_in, p_out = pnl[m], pnl[~m]
+            t = 0.0
+            if n_in >= 2 and n_out >= 2:
+                se = math.sqrt(p_in.var(ddof=1) / n_in + p_out.var(ddof=1) / n_out)
+                t = float((p_in.mean() - p_out.mean()) / se) if se > 0 else 0.0
+            active = n_in >= MIN_TAG_N and n_out >= 10
+            w = float(np.clip(1 + LEARN_STRENGTH * t, W_MIN, W_MAX)) if active else 1.0
+            if active:
+                out["weights"][name] = round(w, 2)
+            out["tags"].append(dict(signal=name, trades=n_in, win_pct=round(float((p_in > 0).mean() * 100), 1),
+                                    avg_pnl=round(float(p_in.mean()), 1), t_stat=round(t, 2),
+                                    weight=round(w, 2), active=active))
+        out["trades"] = len(df)
+        out["win_pct"] = round(float((pnl > 0).mean() * 100), 1)
+        out["avg_pnl"] = round(float(pnl.mean()), 1)
+        for col, key in (("side", "by_side"), ("scan", "by_scan")):
+            g = df.groupby(col)["plan_pnl"]
+            out[key] = {str(k): dict(trades=int(v.size), win_pct=round(float((v > 0).mean() * 100), 1),
+                                     avg_pnl=round(float(v.mean()), 1)) for k, v in g}
+    _save_json(LEARN_FILE, out)
+    return out
+
 # ----------------------------- SCAN -----------------------------
 
 def scan_once(mode, pre_prev=None, label=None):
     now = dt.datetime.now(ET)
+    refresh_weights()
     mkt = market_bias(mode)
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         analysed = [a for a in ex.map(lambda s: analyse(s, mode, pre_prev, mkt), SYMBOLS) if a]
@@ -755,7 +1002,8 @@ def scan_once(mode, pre_prev=None, label=None):
 
     res = {"mode": mode, "label": label or {"pre": "Premarket", "open": "Open 09:45", "hourly": "Hourly"}[mode],
            "time": now.isoformat(timespec="seconds"), "CALL": None, "PUT": None, "top": None, "market": mkt,
-           "table": table, "scores": {a["sym"]: a["score"] for a in analysed}, "scanned": len(analysed)}
+           "table": table, "scores": {a["sym"]: a["score"] for a in analysed}, "scanned": len(analysed),
+           "learned": len(LEARNED_W)}
     for b in built:
         if res[b["side"]] is None or b["rank"] > res[b["side"]]["rank"]:
             res[b["side"]] = b
@@ -763,6 +1011,10 @@ def scan_once(mode, pre_prev=None, label=None):
     if picks:
         res["top"] = max(picks, key=lambda s: res[s]["rank"])
     log_picks(res)
+    try:
+        record_trades(built, res, now)                    # every candidate is tracked, results fetched later
+    except Exception:
+        pass
     return res
 
 # ----------------------------- SCHEDULE -----------------------------
@@ -836,6 +1088,7 @@ def run_scheduled(cfg):
 #   4. walks forward bar by bar: stop loss checked first (worst case) then take profit, otherwise exit 15:45 ET,
 #   5. runs the same scans twice - WITH price action and WITHOUT - so you can see what it adds.
 # The SPY market filter and volume filter are replayed too. The earnings filter is live-only (no history).
+# The backtest never uses the learned weights (they come from the live results, so using them here would be circular).
 
 def fetch_history(symbols, progress=None):
     """{symbol: (5-min bars incl. premarket, last 60 days ; daily bars, 6 months)}"""
@@ -902,8 +1155,10 @@ def synth_option(sym, S, side, hv, now, iv_mult, slip):
                 entry=px * (1 + slip), delta=g["delta"])
 
 
-def simulate_trade(opt, plan, bars, slip):
-    """Walk the 5-min bars forward. Returns (exit_option_price, reason, exit_time) or None."""
+def simulate_trade(opt, plan, bars, slip, offset=0.0):
+    """Walk the 5-min bars forward. Returns (exit_option_price, reason, exit_time) or None.
+       offset = dollars added to the Black-Scholes value (used when settling live trades, so the modelled price
+       starts exactly at the real entry price; 0 in the backtest)."""
     if bars is None or bars.empty:
         return None
     side, K, iv, exp_dt = opt["side"], opt["strike"], opt["iv"], opt["exp_dt"]
@@ -911,7 +1166,7 @@ def simulate_trade(opt, plan, bars, slip):
 
     def val(S, t_end):
         T = max((exp_dt - t_end).total_seconds() / (365 * 86400), 1.0 / (365 * 24))
-        return bs_price(S, K, T, iv, side)
+        return max(bs_price(S, K, T, iv, side) + offset, 0.0)
 
     last_ts = None
     for ts, b in zip(bars.index, bars.itertuples()):
@@ -1164,7 +1419,7 @@ def tv_url(sym, interval="5"):
     return f"https://www.tradingview.com/chart/?symbol={sym.replace('-', '.')}&interval={interval}"
 
 
-# ----- market panels: indices box + top 10 shares -----
+# ----- market panels: indices list + commodities list + top 10 shares -----
 def get_quote(sym):
     """{price, chg, pct} vs the previous close, or None."""
     px = prev = None
@@ -1203,13 +1458,44 @@ def _metric_grid(items, quotes, ncol=5):
                           delta_color="inverse" if sym == "^VIX" else "normal")
 
 
+def _list_html(items, quotes):
+    """Compact list view: name | price | change | % (green up / red down; the VIX is reversed)."""
+    td = "padding:5px 6px;border-bottom:1px solid rgba(128,128,128,0.25)"
+    rows = []
+    for name, sym in items:
+        d = quotes.get(sym)
+        if not d:
+            rows.append(f'<tr><td style="{td}">{name}</td>'
+                        f'<td colspan="3" style="{td};text-align:right;opacity:0.6">n/a</td></tr>')
+            continue
+        good = d["chg"] >= 0
+        if sym == "^VIX":
+            good = not good
+        col = "#2fbf71" if good else "#ef4f5f"
+        rows.append(f'<tr><td style="{td}">{name}</td>'
+                    f'<td style="{td};text-align:right">{d["price"]:,.2f}</td>'
+                    f'<td style="{td};text-align:right;color:{col}">{d["chg"]:+,.2f}</td>'
+                    f'<td style="{td};text-align:right;color:{col};font-weight:600">{d["pct"]:+.2f}%</td></tr>')
+    head = ('<tr style="opacity:0.6;font-size:12px"><td style="padding:2px 6px">Name</td>'
+            '<td style="padding:2px 6px;text-align:right">Price</td>'
+            '<td style="padding:2px 6px;text-align:right">Change</td>'
+            '<td style="padding:2px 6px;text-align:right">%</td></tr>')
+    return f'<table style="width:100%;border-collapse:collapse;font-size:14px">{head}{"".join(rows)}</table>'
+
+
 def render_market(box):
-    syms = tuple(s for _, s in INDICES) + tuple(s for _, s in TOP10)
+    syms = tuple(s for _, s in INDICES) + tuple(s for _, s in COMMODITIES) + tuple(s for _, s in TOP10)
     q = market_quotes(syms)
     with box.container():
-        with st.container(border=True):
-            st.markdown("**US indices** - price and change on the day")
-            _metric_grid(INDICES, q)
+        c1, c2 = st.columns(2)
+        with c1:
+            with st.container(border=True):
+                st.markdown("**US indices** - price and change on the day")
+                st.markdown(_list_html(INDICES, q), unsafe_allow_html=True)
+        with c2:
+            with st.container(border=True):
+                st.markdown("**Commodities** - futures, price and change on the day")
+                st.markdown(_list_html(COMMODITIES, q), unsafe_allow_html=True)
         with st.container(border=True):
             st.markdown("**Top 10 US shares** - price and change on the day")
             _metric_grid([(f"{n} ({s})", s) for n, s in TOP10], q)
@@ -1370,7 +1656,8 @@ def draw_box(item, side, is_top):
             st.write(f"**Take profit ${p['tp']:.2f} -> +${p['profit_1lot']:,.0f} per lot** | "
                      f"stop loss ${p['sl']:.2f} -> -${p['loss_1lot']:,.0f} per lot")
             st.caption("Exit: at TP or SL, early if a 5-min bar closes back through EMA15 against you, "
-                       "otherwise by 15:45 ET.")
+                       "otherwise by 15:45 ET. The result of this trade is fetched automatically after the trade day "
+                       "and after expiry (Learning tab).")
         with right:
             st.markdown(order_ticket_html(item), unsafe_allow_html=True)
 
@@ -1387,14 +1674,73 @@ def render_scan(res, empty_msg):
         return
     when = dt.datetime.fromisoformat(res["time"])
     tg = " | Telegram sent ✅" if res.get("telegram") else ""
+    lr = f" | learned weights: {res['learned']} signals" if res.get("learned") else ""
     st.write(f"Scan time: **{when.strftime('%a %d %b %H:%M')} ET** ({fmt_local(when)} your time) | "
              f"{res.get('scanned', '?')}/{len(SYMBOLS)} stocks read | "
-             f"{MARKET_SYM} market bias: **{_bias_txt(res.get('market', 0))}**{tg}")
+             f"{MARKET_SYM} market bias: **{_bias_txt(res.get('market', 0))}**{tg}{lr}")
     draw_box(res.get("CALL"), "CALL", res.get("top") == "CALL")
     draw_box(res.get("PUT"), "PUT", res.get("top") == "PUT")
     with st.expander("All stocks - direction score & day estimate"):
         if res.get("table"):
             st.dataframe(pd.DataFrame(res["table"]).sort_values("score", key=abs, ascending=False))
+
+
+# ----- learning tab -----
+def _result_table(df, col):
+    g = df[df[col].notna()]
+    if g.empty:
+        return pd.DataFrame()
+    grp = g.groupby("side")[col]
+    return pd.DataFrame({"trades": grp.size(), "win %": grp.apply(lambda x: round((x > 0).mean() * 100, 1)),
+                         "total $/lot": grp.sum().round(0), "avg $/lot": grp.mean().round(1)})
+
+
+def render_learning_tab(cfg):
+    st.caption("Every candidate of every live scan is saved. After the trade day its plan is replayed on the real "
+               "5-minute bars (stop / target / 15:45 exit, option MODELLED from the logged entry and IV). After "
+               "expiry the stock's closing price on the expiry date gives the exact expiry value. The signal weights "
+               "are re-learned from the plan results; a signal changes weight only after 25+ settled trades. "
+               "Expiry result = holding the option to expiry, shown for information.")
+    if st.button("Fetch results now"):
+        with st.spinner("Fetching results..."):
+            n = settle_pending(cfg)
+        st.success(f"{n} new results" if n else "Nothing new to settle yet.")
+    rows = load_tracker()
+    if not rows:
+        st.info("No tracked trades yet - they are saved automatically from the next live scan (09:45-14:45 ET).")
+        return
+    df = pd.DataFrame(rows)
+    only_picks = st.checkbox("Only the best CALL / PUT shown on screen (untick = all tracked candidates)", value=False)
+    if only_picks:
+        df = df[df["picked"]]
+    n_plan, n_exp = int(df["plan_pnl"].notna().sum()), int(df["expiry_pnl"].notna().sum())
+    m = st.columns(4)
+    m[0].metric("Tracked trades", len(df))
+    m[1].metric("Trade-day results in", n_plan)
+    m[2].metric("Expiry results in", n_exp)
+    m[3].metric("Signals re-weighted", len(_load_json(LEARN_FILE).get("weights", {})))
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Plan result (stop / target / 15:45 exit)**")
+        t = _result_table(df, "plan_pnl")
+        st.dataframe(t) if not t.empty else st.info("Waiting for the first trade day to end (16:10 ET).")
+    with c2:
+        st.markdown("**Expiry result (held to expiry)**")
+        t = _result_table(df, "expiry_pnl")
+        st.dataframe(t) if not t.empty else st.info("Waiting for the first option to expire.")
+    learned = _load_json(LEARN_FILE)
+    st.markdown("**What it has learned** (weight 1.0 = unchanged; changes only after "
+                f"{MIN_TAG_N}+ settled trades per signal)")
+    if learned.get("tags"):
+        st.dataframe(pd.DataFrame(learned["tags"]).sort_values("trades", ascending=False))
+        st.caption(f"Learned from {learned.get('trades', 0)} settled trades (one per day / stock / side), "
+                   f"win rate {learned.get('win_pct', 0)}%, avg ${learned.get('avg_pnl', 0)}/lot. Updated {learned.get('updated', '')}.")
+    else:
+        st.info("Nothing learned yet - the first results arrive after the first trade day.")
+    with st.expander("All tracked trades"):
+        cols = ["time", "scan", "sym", "side", "picked", "strike", "expiry", "entry", "tp", "sl", "score",
+                "plan_reason", "plan_pnl", "expiry_close", "expiry_value", "expiry_pnl"]
+        st.dataframe(df[[c for c in cols if c in df.columns]].sort_values("time", ascending=False))
 
 
 # ----- backtest tab -----
@@ -1569,18 +1915,28 @@ def cli_backtest(days):
         print(_breakdown(g, "scan").to_string())
     print(f"\nTrades saved to {BT_FILE}")
 
+
+def cli_settle():
+    n = settle_pending(load_config())
+    learned = _load_json(LEARN_FILE)
+    print(f"{n} new results. Learned from {learned.get('trades', 0)} settled trades; "
+          f"{len(learned.get('weights', {}))} signals re-weighted.")
+
 # ----------------------------- STREAMLIT UI -----------------------------
 
 def main():
+    global LEARN_ON
     st.set_page_config(page_title="US Call/Put Scanner", layout="wide")
     cfg = load_config()
 
     st.title("📈 US Top-100 Call / Put Scanner")
     st.caption("Scans: 09:45 ET, then every hour 10:45-14:45 ET - each one is sent to Telegram. Next expiry (not same "
-               "day) - all Greeks + price action + market filter - educational only, not advice.")
+               "day) - all Greeks + price action + market filter - results are tracked and the scoring learns from "
+               "them - educational only, not advice.")
 
     with st.sidebar:
         auto = st.toggle("Auto scans (see schedule)", value=True)
+        LEARN_ON = st.toggle("Self-learning (use learned signal weights)", value=True)
         with st.expander("Telegram"):
             bot = st.text_input("Bot token", value=cfg.get("telegram_bot_token", ""), type="password")
             chat = st.text_input("Chat ID", value=cfg.get("telegram_chat_id", ""))
@@ -1596,9 +1952,17 @@ def main():
         run_open = st.button("Open-style scan now")
         run_hourly = st.button("Hourly-style scan now")
 
-    # indices box + top 10 shares first, so they show while a scan is running
+    refresh_weights()
+
+    # layout: the CALL / PUT picks (and the other tabs) on TOP, the market lists below them
+    top = st.container()
     mkt_box = st.empty()
     render_market(mkt_box)
+
+    try:
+        settle_pending(cfg)                      # fetch results of finished trades + re-learn (quick when nothing is due)
+    except Exception:
+        pass
 
     if auto:
         run_scheduled(cfg)
@@ -1624,45 +1988,51 @@ def main():
     everything = list(scheduled.values()) + [r for r in manual.values() if ok(r)]
     latest = max(everything, key=when_of) if everything else None
 
-    # today's schedule at a glance
-    marks = []
-    for key, _, start, _, label in SCHEDULE:
-        if _done(state, key, today):
-            marks.append(f"✅ {start:%H:%M}")
-        else:
-            marks.append(f"⏳ {start:%H:%M}")
-    st.caption("Today (ET): " + "  ".join(marks))
-
     def newest(key, mode):
         a, b = scheduled.get(key), manual.get(mode)
         return max([x for x in (a, b) if ok(x)], key=when_of) if (ok(a) or ok(b)) else (state.get(key) or None)
 
-    t_latest, t_open, t_hour, t_bt = st.tabs(["Latest scan", "Open 09:45", "Hourly scans", "Backtest"])
-    with t_latest:
-        render_scan(latest, "No scan yet - the first one runs at 09:45 ET (or use a manual run).")
-    with t_open:
-        render_scan(newest("open", "open"), "No open scan yet - runs at 09:45 ET.")
-    with t_hour:
-        hourly = sorted([r for r in everything if r.get("mode") == "hourly"], key=when_of, reverse=True)
-        if hourly:
-            names = [f"{h.get('label', 'Hourly')} - {when_of(h):%a %H:%M} ET" for h in hourly]
-            pick = st.selectbox("Hourly scan", names, index=0)
-            render_scan(hourly[names.index(pick)], "")
-        else:
-            st.info("No hourly scan yet - they run at 10:45, 11:45, 12:45, 13:45 and 14:45 ET.")
-    with t_bt:
-        render_backtest_tab()
+    with top:
+        marks = []
+        for key, _, start, _, label in SCHEDULE:
+            marks.append(f"{'✅' if _done(state, key, today) else '⏳'} {start:%H:%M}")
+        st.caption("Today (ET): " + "  ".join(marks))
+
+        t_latest, t_open, t_hour, t_learn, t_bt = st.tabs(
+            ["Latest scan", "Open 09:45", "Hourly scans", "Learning", "Backtest"])
+        with t_latest:
+            render_scan(latest, "No scan yet - the first one runs at 09:45 ET (or use a manual run).")
+        with t_open:
+            render_scan(newest("open", "open"), "No open scan yet - runs at 09:45 ET.")
+        with t_hour:
+            hourly = sorted([r for r in everything if r.get("mode") == "hourly"], key=when_of, reverse=True)
+            if hourly:
+                names = [f"{h.get('label', 'Hourly')} - {when_of(h):%a %H:%M} ET" for h in hourly]
+                pick = st.selectbox("Hourly scan", names, index=0)
+                render_scan(hourly[names.index(pick)], "")
+            else:
+                st.info("No hourly scan yet - they run at 10:45, 11:45, 12:45, 13:45 and 14:45 ET.")
+        with t_learn:
+            render_learning_tab(cfg)
+        with t_bt:
+            render_backtest_tab()
+        box = st.empty()
 
     if auto:
-        box = st.empty()
-        last_mkt = time.time()
+        last_mkt = last_settle = time.time()
         while True:
             now = dt.datetime.now(ET)
             if due_scan(now, load_state()):
                 st.rerun()
-            if time.time() - last_mkt >= MARKET_REFRESH_SEC:          # keep the index / top-10 prices fresh
+            if time.time() - last_mkt >= MARKET_REFRESH_SEC:          # keep the index / commodity prices fresh
                 render_market(mkt_box)
                 last_mkt = time.time()
+            if time.time() - last_settle >= SETTLE_EVERY_SEC:         # pick up finished trades while the page is open
+                try:
+                    settle_pending(cfg)
+                except Exception:
+                    pass
+                last_settle = time.time()
             entry, when = next_scan(now)
             left = int((when - now).total_seconds())
             box.caption(f"Next: **{entry[4]}** at {when.strftime('%a %H:%M')} ET ({fmt_local(when)} your time) - in "
@@ -1671,7 +2041,9 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--sweep" in sys.argv:
+    if "--settle" in sys.argv:
+        cli_settle()
+    elif "--sweep" in sys.argv:
         i = sys.argv.index("--sweep")
         cli_sweep(int(sys.argv[i + 1]) if len(sys.argv) > i + 1 and sys.argv[i + 1].isdigit() else 40)
     elif "--backtest" in sys.argv:
