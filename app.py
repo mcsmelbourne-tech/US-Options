@@ -2714,16 +2714,25 @@ def render_top10_box(box, res):
                               for r in ok_rows]
                     pick = st.selectbox("Contract", labels, key="t10_box_pick")
                     r = ok_rows[labels.index(pick)]
-                    _opt_chart_link(r["opt"])
+                    o, p, cv = r["opt"], r["plan"], r["cv"]
+                    st.markdown(f"**Enter in Moomoo:** `{_moomoo_code(o)}` · Buy · Limit **{p['entry']:.2f}** · 1 contract · "
+                                f"Day · TP **{p['tp']:.2f}** · SL **{p['sl']:.2f}** (GTC)")
+                    _opt_chart_link(o)
                     try:
                         png = ticket_png(r)
                         st.image(png, width=260)
                         st.download_button("⬇ Download ticket (PNG)", png,
-                                           file_name=f"moomoo_{r['sym']}_{r['side']}_{r['opt']['expiry']}.png",
-                                           mime="image/png", key=f"t10boxdl_{r['sym']}_{r['opt']['expiry']}")
+                                           file_name=f"moomoo_{r['sym']}_{r['side']}_{o['expiry']}.png",
+                                           mime="image/png", key=f"t10boxdl_{r['sym']}_{o['expiry']}_{o['strike']}_{r['side']}")
                         st.caption("Replica of the Moomoo order screen - not a real screenshot of your account.")
                     except Exception:
                         st.caption("Ticket picture unavailable for this contract.")
+                    st.markdown(f"**Why grade {cv['grade']} ({cv['pts']}/100)**")
+                    for ok_, text in cv["checks"]:
+                        st.write(("✅ " if ok_ else ("❌ " if ok_ is False else "➖ ")) + text)
+                    st.caption(f"Delta {o['delta']:.3f} | gamma {o['gamma']:.4f} | theta {o['theta']:.3f}/day | "
+                               f"vega {o['vega']:.3f} | rho {o['rho']:.3f} | IV {o['iv'] * 100:.1f}% | bid / ask "
+                               f"{o['bid']:.2f} / {o['ask']:.2f} | vol / OI {o['vol']} / {o['oi']} | reward:risk {p['rr']}")
             st.caption("'weak' = low score, 'low R:R' = reward:risk under the minimum, 'earnings' = results before expiry. "
                        "Market closed = last traded option prices, so re-check bid / ask at the open before entering. "
                        "Ticket pictures and Greeks: Top 10 options tab. Estimates, not advice.")
