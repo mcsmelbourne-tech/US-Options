@@ -1233,18 +1233,23 @@ def conviction(a, opt, plan, side, earn):
     return dict(pts=total, grade=grade, checks=checks)
 
 
+TOP10_POOL = 30                                  # strongest shares (by |score|) of the 100 whose options get graded
+
+
 def build_top10(analysed):
-    """Top 10 US shares, next two expiries. For each share: the predicted direction (CALL if the day estimate is above
-       the price, else PUT). For each expiry the best TOP10_CONTRACTS contracts (Greeks / spread / liquidity ranking)
-       are turned into trade plans and graded with conviction(); the highest-conviction contract is shown. Then the
-       better expiry of each share is marked (best_exp) and the three best setups of grade C or better are ranked."""
+    """The 10 best options out of ALL scanned shares (not a fixed list): the TOP10_POOL strongest signals are taken,
+       for each the predicted direction (CALL if the day estimate is above the price, else PUT) and, for the next two
+       expiries, the best TOP10_CONTRACTS contracts are graded with conviction(); the highest-conviction contract is
+       shown. Each share's better expiry is marked (best_exp), the shares are ranked by that grade and the top 10 are
+       kept (rank 1-10), best first."""
     by = {a["sym"]: a for a in analysed}
+    names = {sy: n for n, sy in TOP10}
+    pool = sorted(analysed, key=lambda a: -abs(a["score"]))[:TOP10_POOL]
 
     def one(item):
-        name, sym, nth = item
-        a = by.get(sym)
-        if not a:
-            return dict(name=name, sym=sym, exp_n=nth + 1, error="no price data")
+        sym, nth = item
+        a = by[sym]
+        name = names.get(sym, sym)
         side = "CALL" if a["pred_close"] > a["spot"] else "PUT"
         base = dict(name=name, sym=sym, side=side, score=a["score"], exp_n=nth + 1)
         opts = pick_option(sym, a["spot"], side, a["hv"], nth, top_k=TOP10_CONTRACTS)
@@ -1273,16 +1278,25 @@ def build_top10(analysed):
                            pa_s=a["pa_s"]))
 
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        rows = list(ex.map(one, [(n, s, k) for n, s in TOP10 for k in (0, 1)]))   # next expiry and the one after
+        rows = list(ex.map(one, [(a["sym"], k) for a in pool for k in (0, 1)]))   # next expiry and the one after
 
-    ok = [r for r in rows if not r.get("error")]
-    for sym in {r["sym"] for r in ok}:
-        mine = [r for r in ok if r["sym"] == sym]
-        max(mine, key=lambda r: (r["cv"]["pts"], -r["exp_n"]))["best_exp"] = True     # better expiry of this share
-    ranked = sorted([r for r in ok if r.get("best_exp") and r["cv"]["grade"] != "D"],
-                    key=lambda r: -r["cv"]["pts"])
-    for i, r in enumerate(ranked[:3], 1):
-        r["rank"] = i
+    best_by_sym = {}
+    for r in rows:
+        if r.get("error"):
+            continue
+        cur = best_by_sym.get(r["sym"])
+        if cur is None or (r["cv"]["pts"], -r["exp_n"]) > (cur["cv"]["pts"], -cur["exp_n"]):
+            best_by_sym[r["sym"]] = r
+    if not best_by_sym:
+        return rows
+    for r in best_by_sym.values():
+        r["best_exp"] = True                                       # better expiry of this share
+    ranked = sorted(best_by_sym.values(), key=lambda r: (-r["cv"]["pts"], r["exp_n"]))[:10]
+    order = {r["sym"]: i for i, r in enumerate(ranked, 1)}
+    for r in ranked:
+        r["rank"] = order[r["sym"]]
+    rows = [r for r in rows if r["sym"] in order]
+    rows.sort(key=lambda r: (order[r["sym"]], r["exp_n"]))
     return rows
 
 
@@ -1738,7 +1752,8 @@ def telegram_text(res):
             lines.append(f"Price action: {a['pa']['struct']} | {pa_txt}")
     if not shown:
         lines.append("No qualifying setup this scan.")
-    best = sorted([r for r in (res.get("top10") or []) if r.get("rank")], key=lambda r: r["rank"])
+    best = sorted([r for r in (res.get("top10") or []) if r.get("rank") and r["rank"] <= 3 and r["cv"]["grade"] != "D"],
+                  key=lambda r: r["rank"])
     if best:
         lines.append("")
         lines.append("🏆 TOP-10 BEST SETUPS (conviction grade)")
@@ -2556,7 +2571,7 @@ def _top10_html(rows):
     head = ('<tr style="opacity:0.6;font-size:12px"><td style="padding:2px 6px">Share</td>'
             '<td style="padding:2px 6px">Next expiry</td><td style="padding:2px 6px">2nd expiry</td></tr>')
     legend = ('<div style="font-size:11px;opacity:0.65;margin-top:6px">Grade = conviction points out of 100 '
-              '(A 75+, B 60+, C 45+, D = skip). &#9733; = better expiry of the two. #1-#3 = best setups of the 10. '
+              '(A 75+, B 60+, C 45+, D = skip). &#9733; = better expiry of the two. #n = rank among the 10 best options of the 100 shares. '
               'Of 3 candidate contracts per expiry the highest-grade one is shown.</div>')
     return f'<table style="width:100%;border-collapse:collapse;font-size:14px">{head}{"".join(out)}</table>{legend}'
 
@@ -2566,7 +2581,7 @@ def render_top10_box(box, res):
        needs, the stop loss and the profit (dollars per lot at stop / target)."""
     with box.container():
         with st.container(border=True):
-            st.markdown("### Top 10 options - next two expiries")
+            st.markdown("### Top 10 options of the 100 shares - next two expiries")
             ok = isinstance(res, dict) and res.get("time") and not res.get("running") and not res.get("error")
             rows = res.get("top10") if ok else None
             if rows and any(not r.get("error") and "cv" not in r for r in rows):  # scan saved by the older version
@@ -2579,6 +2594,22 @@ def render_top10_box(box, res):
                        "Moomoo: Buy - Limit at the price shown - 1 contract - Day - tick Take Profit and Stop Loss (GTC). "
                        "(brackets) = cost of 1 contract; $ next to SL / TP = loss / profit per lot at stop / target.")
             st.markdown(_top10_html(rows), unsafe_allow_html=True)
+            ok_rows = [r for r in rows if not r.get("error") and r.get("opt")]
+            if ok_rows:
+                with st.expander("Moomoo ticket (reference)", expanded=False):
+                    labels = [f"{r['sym']} {r['side']} {_moomoo_code(r['opt'])} ({_exp_label(r)}) - grade {r['cv']['grade']}"
+                              for r in ok_rows]
+                    pick = st.selectbox("Contract", labels, key="t10_box_pick")
+                    r = ok_rows[labels.index(pick)]
+                    try:
+                        png = ticket_png(r)
+                        st.image(png, width=260)
+                        st.download_button("⬇ Download ticket (PNG)", png,
+                                           file_name=f"moomoo_{r['sym']}_{r['side']}_{r['opt']['expiry']}.png",
+                                           mime="image/png", key=f"t10boxdl_{r['sym']}_{r['opt']['expiry']}")
+                        st.caption("Replica of the Moomoo order screen - not a real screenshot of your account.")
+                    except Exception:
+                        st.caption("Ticket picture unavailable for this contract.")
             st.caption("'weak' = low score, 'low R:R' = reward:risk under the minimum, 'earnings' = results before expiry. "
                        "Market closed = last traded option prices, so re-check bid / ask at the open before entering. "
                        "Ticket pictures and Greeks: Top 10 options tab. Estimates, not advice.")
@@ -2587,7 +2618,7 @@ def render_top10_box(box, res):
 def render_top10_options(res):
     """Top 10 US shares: predicted CALL / PUT on the next two expiries, graded A-D from the pick-box details, with the
        values to enter in Moomoo, stop and profit."""
-    st.caption("For each of the top 10 US shares: the predicted direction for the day (CALL = up, PUT = down). For each "
+    st.caption("The 10 best-graded options out of all 100 scanned US shares (the 30 strongest signals are graded). For each share: the predicted direction for the day (CALL = up, PUT = down). For each "
                "of the next two expiries the 3 best contracts (Greeks / spread / liquidity) are compared and the one with "
                "the highest conviction is shown. Conviction = a 0-100 checklist of the same details as the CALL / PUT pick "
                "box: signal score, market (SPY), price action, room to the next level, volume, RSI, gap, reward:risk, "
@@ -2605,7 +2636,7 @@ def render_top10_options(res):
     when = dt.datetime.fromisoformat(res["time"])
     st.write(f"From the scan at **{when.strftime('%a %d %b %H:%M')} ET** ({fmt_local(when)} your time)")
 
-    best = sorted([r for r in rows if r.get("rank")], key=lambda r: r["rank"])
+    best = sorted([r for r in rows if r.get("rank") and r["cv"]["grade"] != "D"], key=lambda r: r["rank"])
     if best:
         st.markdown("**Best setups right now** (best expiry of each share, grade C or better)")
         for r in best:
@@ -2622,14 +2653,14 @@ def render_top10_options(res):
     for r in rows:
         if r.get("error"):
             if not hide_d:
-                table.append({"Share": f"{r['name']} ({r['sym']})", "Pick": r.get("side", "-"), "Moomoo contract": r["error"]})
+                table.append({"Share": r["sym"], "Pick": r.get("side", "-"), "Moomoo contract": r["error"]})
             continue
         cv = r["cv"]
         if hide_d and cv["grade"] == "D":
             continue
         o, p, a = r["opt"], r["plan"], r["a"]
         flags = [f for f, on in (("weak", r["weak"]), ("low R:R", r["low_rr"]), ("earnings", r["earnings"])) if on]
-        table.append({"Share": f"{r['name']} ({r['sym']})", "Pick": r["side"],
+        table.append({"Share": r["sym"], "Pick": r["side"],
                       "Expiry": _exp_label(r) + " " + o["expiry"], "Grade": cv["grade"], "Conviction": cv["pts"],
                       "Best expiry": "★" if r.get("best_exp") else "", "Rank": r.get("rank", ""),
                       "Moomoo contract": _moomoo_code(o), "Buy limit": p["entry"], "Stop loss": p["sl"],
@@ -2673,8 +2704,13 @@ def render_top10_options(res):
             if not o["market_open"]:
                 st.caption("Option quotes not live (market closed) - last price used. Confirm bid/ask before entry.")
             try:
-                st.image(ticket_png(r), width=260)
-                st.caption("Replica of the Moomoo order screen with the values to enter - not a real screenshot.")
+                png = ticket_png(r)
+                st.markdown("**Moomoo ticket (reference)**")
+                st.image(png, width=260)
+                st.download_button("⬇ Download ticket (PNG)", png,
+                                   file_name=f"moomoo_{o['symbol']}_{r['side']}_{o['expiry']}.png", mime="image/png",
+                                   key=f"t10dl_{o['symbol']}_{o['expiry']}_{o['strike']}_{p['entry']}")
+                st.caption("Replica of the Moomoo order screen - not a real screenshot of your account.")
             except Exception:
                 pass
 
