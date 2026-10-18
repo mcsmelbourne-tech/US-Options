@@ -290,6 +290,104 @@ def _pw_ok(pw, cfg):
     return False
 
 
+def password_change_form(cfg):
+    """Sidebar form: change the password stored in config.json (needs the current password)."""
+    with st.expander("🔑 Change password"):
+        if os.getenv("SCANNER_PASSWORD") or _pw_secret():
+            st.info("The password comes from the SCANNER_PASSWORD variable / the Streamlit secret scanner_password - "
+                    "change it there, then restart the app.")
+            return
+        with st.form("change_password", clear_on_submit=True):
+            cur = st.text_input("Current password", type="password")
+            n1 = st.text_input("New password (8+ characters)", type="password")
+            n2 = st.text_input("Repeat new password", type="password")
+            go = st.form_submit_button("Change password")
+        if go:
+            if not _pw_ok(cur, cfg):
+                time.sleep(1.5)
+                st.error("The current password is wrong.")
+            elif len(n1) < 8:
+                st.error("Use at least 8 characters.")
+            elif n1 != n2:
+                st.error("The two new passwords do not match.")
+            elif n1 == cur:
+                st.error("The new password must be different.")
+            else:
+                cfg["password_hash"] = _pw_hash(n1)
+                save_config(cfg)
+                st.success("Password changed - use the new one the next time you log in.")
+
+
+GLASS_CSS = """
+<style>
+.stApp {
+  background:
+    radial-gradient(1100px 520px at 12% -8%, rgba(255,255,255,0.11), transparent 60%),
+    radial-gradient(800px 480px at 105% 4%, rgba(110,150,255,0.10), transparent 58%),
+    radial-gradient(900px 600px at 50% 120%, rgba(255,255,255,0.05), transparent 60%),
+    linear-gradient(160deg, #06070b 0%, #0a0c12 45%, #020305 100%);
+  background-attachment: fixed;
+  color: #e8eaed;
+  color-scheme: dark;
+}
+header[data-testid="stHeader"] { background: transparent; }
+section[data-testid="stSidebar"] > div {
+  background: rgba(10,12,18,0.74);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  backdrop-filter: blur(18px) saturate(140%);
+  border-right: 1px solid rgba(255,255,255,0.08);
+}
+div[data-testid="stVerticalBlockBorderWrapper"] {
+  background: linear-gradient(145deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02) 45%, rgba(255,255,255,0.04));
+  -webkit-backdrop-filter: blur(14px) saturate(150%);
+  backdrop-filter: blur(14px) saturate(150%);
+  border: 1px solid rgba(255,255,255,0.13) !important;
+  border-radius: 16px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.20), inset 0 -1px 0 rgba(0,0,0,0.45), 0 10px 34px rgba(0,0,0,0.55);
+}
+div[data-testid="stExpander"] details {
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 12px;
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+}
+.stButton > button, .stDownloadButton > button, [data-testid="stLinkButton"] a, a[data-testid^="stBaseLinkButton"] {
+  background: linear-gradient(180deg, rgba(255,255,255,0.16), rgba(255,255,255,0.04));
+  border: 1px solid rgba(255,255,255,0.18);
+  border-radius: 10px;
+  color: #f2f4f8;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.22), 0 4px 14px rgba(0,0,0,0.45);
+}
+.stButton > button:hover, .stDownloadButton > button:hover, [data-testid="stLinkButton"] a:hover {
+  border-color: rgba(255,255,255,0.40);
+  background: linear-gradient(180deg, rgba(255,255,255,0.24), rgba(255,255,255,0.07));
+}
+.stButton > button[kind="primary"] {
+  background: linear-gradient(180deg, rgba(255,120,70,0.95), rgba(214,70,24,0.92));
+  border-color: rgba(255,170,130,0.55);
+}
+div[data-baseweb="input"] > div, div[data-baseweb="select"] > div, div[data-baseweb="textarea"] > div {
+  background: rgba(255,255,255,0.06);
+  border-color: rgba(255,255,255,0.14);
+}
+div[data-testid="stForm"] {
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 14px;
+}
+button[data-baseweb="tab"] { color: rgba(232,234,237,0.70); }
+button[data-baseweb="tab"][aria-selected="true"] { color: #ffffff; }
+</style>
+"""
+
+
+def apply_theme():
+    """Black glass look (sidebar toggle 'Black glass theme'). Pure CSS - nothing else on the page changes."""
+    if st.session_state.get("glass", True):
+        st.markdown(GLASS_CSS, unsafe_allow_html=True)
+
+
 def password_gate(cfg):
     """True when this browser session is logged in. Otherwise shows the login (or first-time set-up) form."""
     if st.session_state.get("authed"):
@@ -3171,6 +3269,7 @@ def main():
     global LEARN_ON
     st.set_page_config(page_title="US Call/Put Scanner", layout="wide")
     cfg = load_config()
+    apply_theme()
     if not password_gate(cfg):                 # nothing below (scans, prices, picks) runs before the password is entered
         return
 
@@ -3183,6 +3282,8 @@ def main():
         if st.button("🔒 Log out"):
             st.session_state["authed"] = False
             st.rerun()
+        st.toggle("Black glass theme", value=True, key="glass")
+        password_change_form(cfg)
         auto = st.toggle("Auto scans (see schedule)", value=True)
         LEARN_ON = st.toggle("Self-learning (use learned signal weights)", value=True)
         with st.expander("Telegram"):
