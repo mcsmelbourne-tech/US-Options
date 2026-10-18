@@ -829,6 +829,7 @@ def pick_option(sym, spot, side, hv, nth=0, top_k=1):
                 + math.log10(oi + vol + 1) * 3          # liquidity
             )
             rows.append(dict(symbol=sym, side=side, expiry=expiry, dte=dte, T=T,
+                             contract=str(o.get("contractSymbol") or ""),
                              strike=float(o["strike"]), bid=bid, ask=ask, last=last, entry=entry,
                              iv=iv, iv_ratio=iv_ratio, vol=vol, oi=oi, spread=spread, market_open=market_open,
                              delta=g["delta"], gamma=g["gamma"], theta=g["theta"], vega=g["vega"], rho=g["rho"],
@@ -1828,7 +1829,7 @@ def telegram_text(res):
             f"Δ{o['delta']:.2f} Γ{o['gamma']:.3f} Θ{o['theta']:.2f} V{o['vega']:.2f} ρ{o['rho']:.2f} IV{o['iv'] * 100:.0f}%",
             f"Stock {a['spot']:.2f} → day est {a['pred_close']:.2f} (H {a['pred_high']:.2f} / L {a['pred_low']:.2f})",
         ]
-        lines.append(f"Chart: {tv_url(o['symbol'])}")
+        lines.append(f"Option chart: {tv_option_url(o)}")
         pa_txt = " ".join(t.replace("PA:", "") for t in a["pa_tags"] + (["PA:blocked"] if "PA:blocked" in a["tags"] else []))
         if pa_txt:
             lines.append(f"Price action: {a['pa']['struct']} | {pa_txt}")
@@ -1849,6 +1850,35 @@ def telegram_text(res):
 
 def fmt_local(when):
     return when.astimezone(LOCAL_TZ).strftime("%a %d %b %H:%M")
+
+
+def tv_option_url(o, interval="5"):
+    """TradingView chart of the OPTION CONTRACT itself (OPRA feed), e.g. OPRA:PEP261023C131.0 - not the share.
+       Built from Yahoo's OCC contract symbol (root + YYMMDD + C/P + strike x 1000); falls back to the symbol, expiry,
+       side and strike when the contract symbol is missing (scans saved by an older version)."""
+    import re as _re
+    m = _re.match(r"^(.+?)(\d{6})([CP])(\d{8})$", str(o.get("contract") or ""))
+    if m:
+        root, ymd, cp, strike = m.group(1), m.group(2), m.group(3), int(m.group(4)) / 1000.0
+    else:
+        root = str(o["symbol"]).lstrip("^").replace("-", "").replace(".", "")
+        ymd = o["expiry"][2:4] + o["expiry"][5:7] + o["expiry"][8:10]
+        cp = "C" if o["side"] == "CALL" else "P"
+        strike = float(o["strike"])
+    ks = f"{strike:.3f}".rstrip("0")
+    if ks.endswith("."):
+        ks += "0"
+    return f"https://www.tradingview.com/chart/?symbol=OPRA%3A{root}{ymd}{cp}{ks}&interval={interval}"
+
+
+def _opt_chart_link(o):
+    """Button that opens the CALL / PUT contract chart in TradingView (new tab)."""
+    label = f"📈 Open {str(o['symbol']).lstrip('^')} {o['side']} {o['strike']:g} ({o['expiry']}) option chart in TradingView"
+    url = tv_option_url(o)
+    try:
+        st.link_button(label, url)
+    except AttributeError:                                      # older Streamlit
+        st.markdown(f"[{label}]({url})")
 
 
 def tv_url(sym, interval="5"):
@@ -2310,8 +2340,8 @@ def order_ticket_html(item):
         f'<div style="background:{_BG};border-radius:8px;padding:14px 16px;max-width:340px;'
         f'font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:{_TXT}">'
         f'<div style="font-size:16px;font-weight:600">Trade</div>'
-        f'<div style="font-size:12px;margin-top:2px"><a href="{tv_url(o["symbol"])}" target="_blank" rel="noopener" '
-        f'style="color:{_BLU};text-decoration:none">{o["symbol"]} - {o["side"]} - open chart in TradingView &#8599;</a></div>'
+        f'<div style="font-size:12px;margin-top:2px"><a href="{tv_option_url(o)}" target="_blank" rel="noopener" '
+        f'style="color:{_BLU};text-decoration:none">{o["symbol"]} - {o["side"]} - open option chart in TradingView &#8599;</a></div>'
         f'{tabs}{contract_side}'
         f'{_lab("Session")}{_box("RTH only", color=_MUT)}'
         f'{_lab("Order Type")}{_box("Limit<span style=float:right>&#8964;</span>")}'
@@ -2492,11 +2522,11 @@ def draw_box(item, side, is_top, kp="x"):
     o, p, a = item["opt"], item["plan"], item["a"]
     with st.container(border=True):
         st.subheader(f"{icon} {side} - {o['symbol']}" + ("   ⭐ TOP PICK" if is_top else ""))
-        link = tv_url(o["symbol"])
+        link = tv_option_url(o)
         try:
-            st.link_button(f"📈 Open {o['symbol']} chart in TradingView", link)
+            st.link_button(f"📈 Open {o['symbol']} {side} {o['strike']:g} option chart in TradingView", link)
         except AttributeError:                                  # older Streamlit
-            st.markdown(f"[📈 Open {o['symbol']} chart in TradingView]({link})")
+            st.markdown(f"[📈 Open {o['symbol']} {side} {o['strike']:g} option chart in TradingView]({link})")
         pre = f" | premarket scan score {a['pre_score']}" if a.get("pre_score") is not None else ""
         st.caption(f"{'STRONG' if item['strong'] else 'Moderate'} signal | score {a['score']}{pre} | "
                    f"{' '.join(a['tags'])}")
@@ -2634,7 +2664,8 @@ def _top10_html(rows):
                 f'<div>Buy <b>{p["entry"]:.2f}</b> <span style="opacity:0.6">(${p["cost_1lot"]:,.0f})</span></div>'
                 f'<div style="color:#ef4f5f">SL <b>{p["sl"]:.2f}</b> -${p["loss_1lot"]:,.0f}</div>'
                 f'<div style="color:#2fbf71">TP <b>{p["tp"]:.2f}</b> +${p["profit_1lot"]:,.0f}</div>'
-                f'<div style="font-size:11px;opacity:0.65">{stats}</div>{flag_txt}</td>')
+                f'<div style="font-size:11px;opacity:0.65">{stats}</div>{flag_txt}'
+                f'<div style="font-size:11px"><a href="{tv_option_url(o)}" target="_blank" rel="noopener">option chart &#8599;</a></div></td>')
 
     out = []
     for sym, d in by.items():
@@ -2678,11 +2709,12 @@ def render_top10_box(box, res):
             st.markdown(_top10_html(rows), unsafe_allow_html=True)
             ok_rows = [r for r in rows if not r.get("error") and r.get("opt")]
             if ok_rows:
-                with st.expander("Moomoo ticket (reference)", expanded=False):
+                with st.expander("Moomoo ticket (reference)", expanded=True):
                     labels = [f"{r['sym']} {r['side']} {_moomoo_code(r['opt'])} ({_exp_label(r)}) - grade {r['cv']['grade']}"
                               for r in ok_rows]
                     pick = st.selectbox("Contract", labels, key="t10_box_pick")
                     r = ok_rows[labels.index(pick)]
+                    _opt_chart_link(r["opt"])
                     try:
                         png = ticket_png(r)
                         st.image(png, width=260)
@@ -2722,7 +2754,8 @@ def _idx_options_html(rows):
                 f'<div style="opacity:0.7">{_moomoo_code(o)} &middot; R:R {p["rr"]}</div>'
                 f'<div>Buy <b>{p["entry"]:.2f}</b> <span style="opacity:0.6">(${p["cost_1lot"]:,.0f})</span></div>'
                 f'<div style="color:#ef4f5f">SL <b>{p["sl"]:.2f}</b> -${p["loss_1lot"]:,.0f}</div>'
-                f'<div style="color:#2fbf71">TP <b>{p["tp"]:.2f}</b> +${p["profit_1lot"]:,.0f}</div></td>')
+                f'<div style="color:#2fbf71">TP <b>{p["tp"]:.2f}</b> +${p["profit_1lot"]:,.0f}</div>'
+                f'<div style="font-size:11px"><a href="{tv_option_url(o)}" target="_blank" rel="noopener">option chart &#8599;</a></div></td>')
 
     out = []
     for i in names:
@@ -2767,13 +2800,14 @@ def render_index_options_box(box, res):
             st.markdown(_idx_options_html(rows), unsafe_allow_html=True)
             ok_rows = [r for r in rows if not r.get("error") and r.get("opt")]
             if ok_rows:
-                with st.expander("Moomoo ticket (reference)", expanded=False):
+                with st.expander("Moomoo ticket (reference)", expanded=True):
                     labels = [f"{r['name'].split(' (')[0]} {r['side']} {_moomoo_code(r['opt'])} "
                               f"({'next' if r['exp_n'] == 1 else '2nd'} expiry) - grade {r['cv']['grade']}"
                               for r in ok_rows]
                     pick = st.selectbox("Contract", labels, key="idx_box_pick")
                     r = ok_rows[labels.index(pick)]
                     o, p, cv = r["opt"], r["plan"], r["cv"]
+                    _opt_chart_link(o)
                     st.markdown(f"**Enter in Moomoo:** `{_moomoo_code(o)}` · Buy · Limit **{p['entry']:.2f}** · 1 contract · "
                                 f"Day · TP **{p['tp']:.2f}** · SL **{p['sl']:.2f}** (GTC)")
                     try:
@@ -2863,6 +2897,7 @@ def render_top10_options(res):
         title = (f"{icon} {r['sym']} - {r['side']} {_moomoo_code(o)} ({_exp_label(r)}){star} | grade {cv['grade']} "
                  f"{cv['pts']} | buy {p['entry']:.2f} | SL {p['sl']:.2f} | TP {p['tp']:.2f}")
         with st.expander(title):
+            _opt_chart_link(o)
             st.markdown("**Why this grade**")
             for ok_, text in cv["checks"]:
                 st.write(("✅ " if ok_ else ("❌ " if ok_ is False else "➖ ")) + text)
