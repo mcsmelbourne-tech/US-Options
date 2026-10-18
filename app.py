@@ -2569,6 +2569,8 @@ def render_top10_box(box, res):
             st.markdown("### Top 10 options - next two expiries")
             ok = isinstance(res, dict) and res.get("time") and not res.get("running") and not res.get("error")
             rows = res.get("top10") if ok else None
+            if rows and any(not r.get("error") and "cv" not in r for r in rows):  # scan saved by the older version
+                rows = None
             if not rows:
                 st.caption("Appears after the next scan - press the Scan button or wait for the 09:45 ET scan.")
                 return
@@ -2595,8 +2597,10 @@ def render_top10_options(res):
         st.info("No scan yet - press the Scan button above (or wait for the 09:45 ET scan).")
         return
     rows = res.get("top10")
+    if rows and any(not r.get("error") and "cv" not in r for r in rows):      # scan saved by the older version
+        rows = None
     if not rows:
-        st.info("The latest scan has no top-10 data - run a new scan with the button above.")
+        st.info("The latest scan has no graded top-10 data - run a new scan with the button above.")
         return
     when = dt.datetime.fromisoformat(res["time"])
     st.write(f"From the scan at **{when.strftime('%a %d %b %H:%M')} ET** ({fmt_local(when)} your time)")
