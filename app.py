@@ -245,6 +245,99 @@ def send_telegram(cfg, msg):
     except Exception:
         return False
 
+# ----------------------------- PASSWORD GATE -----------------------------
+# The password is read from (first match wins):
+#   1. the SCANNER_PASSWORD environment variable
+#   2. Streamlit secrets:  scanner_password = "..."   (.streamlit/secrets.toml, or Streamlit Cloud > Settings > Secrets)
+#   3. config.json "password_hash" - set from the page the first time it is opened with nothing configured
+# To reset (3): delete the "password_hash" line from config.json and open the page again.
+import hashlib
+import hmac
+
+PW_MAX_TRIES = 5                             # wrong attempts before this browser session is locked
+PW_LOCK_SEC = 300                            # lock time in seconds
+
+
+def _pw_hash(pw, salt=None):
+    salt = salt or os.urandom(16).hex()
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), bytes.fromhex(salt), 200_000).hex()
+    return f"{salt}${h}"
+
+
+def _pw_secret():
+    try:
+        return st.secrets.get("scanner_password")
+    except Exception:
+        return None
+
+
+def _pw_configured(cfg):
+    return bool(os.getenv("SCANNER_PASSWORD") or _pw_secret() or cfg.get("password_hash"))
+
+
+def _pw_ok(pw, cfg):
+    pw_b = (pw or "").encode("utf-8")
+    for plain in (os.getenv("SCANNER_PASSWORD"), _pw_secret()):
+        if plain and hmac.compare_digest(pw_b, str(plain).encode("utf-8")):
+            return True
+    stored = cfg.get("password_hash")
+    if stored and "$" in stored:
+        salt, h = stored.split("$", 1)
+        try:
+            return hmac.compare_digest(_pw_hash(pw or "", salt).split("$", 1)[1], h)
+        except Exception:
+            return False
+    return False
+
+
+def password_gate(cfg):
+    """True when this browser session is logged in. Otherwise shows the login (or first-time set-up) form."""
+    if st.session_state.get("authed"):
+        return True
+    st.title("🔒 US Call / Put Scanner")
+    if not _pw_configured(cfg):
+        st.warning("No password is set yet. Choose one now - open this page yourself first, before sharing the link. "
+                   "(For a hosted page you can instead set SCANNER_PASSWORD or the Streamlit secret scanner_password.)")
+        with st.form("set_password"):
+            p1 = st.text_input("New password (8+ characters)", type="password")
+            p2 = st.text_input("Repeat password", type="password")
+            go = st.form_submit_button("Save password")
+        if go:
+            if len(p1) < 8:
+                st.error("Use at least 8 characters.")
+            elif p1 != p2:
+                st.error("The two passwords do not match.")
+            else:
+                cfg["password_hash"] = _pw_hash(p1)
+                save_config(cfg)
+                st.session_state["authed"] = True
+                st.rerun()
+        return False
+
+    locked = st.session_state.get("pw_lock_until", 0.0)
+    if time.time() < locked:
+        st.error(f"Too many wrong attempts. Try again in {int(locked - time.time()) // 60 + 1} min.")
+        return False
+    with st.form("login"):
+        pw = st.text_input("Password", type="password")
+        go = st.form_submit_button("Open")
+    if go:
+        if _pw_ok(pw, cfg):
+            st.session_state["authed"] = True
+            st.session_state["pw_fails"] = 0
+            st.rerun()
+        fails = st.session_state.get("pw_fails", 0) + 1
+        st.session_state["pw_fails"] = fails
+        time.sleep(1.5)                                          # slows down guessing
+        if fails >= PW_MAX_TRIES:
+            st.session_state["pw_lock_until"] = time.time() + PW_LOCK_SEC
+            st.session_state["pw_fails"] = 0
+            st.error(f"Too many wrong attempts - locked for {PW_LOCK_SEC // 60} minutes.")
+        else:
+            st.error("Wrong password.")
+    return False
+
+
 # ----------------------------- INDICATORS -----------------------------
 
 def ema(s, n):
@@ -661,7 +754,7 @@ def _implied_vol(price, S, K, T, side):
     return (lo + hi) / 2
 
 
-def pick_option(sym, spot, side, hv, nth=0):
+def pick_option(sym, spot, side, hv, nth=0, top_k=1):
     """Next expiry AFTER today (nth=0; nth=1 = the one after that) -> best contract by delta / gamma / theta / vega /
        spread / liquidity / IV-vs-HV."""
     try:
@@ -745,7 +838,8 @@ def pick_option(sym, spot, side, hv, nth=0):
                          delta=f"delta outside {DELTA_MIN}-{DELTA_MAX}")
             PICK_WHY[(sym, nth)] = ", ".join(f"{names[k]} x{v}" for k, v in why.items() if v) or "no contracts"
             return None
-        return max(rows, key=lambda x: x["quality"])
+        return (sorted(rows, key=lambda x: -x["quality"])[:top_k] if top_k > 1
+                else max(rows, key=lambda x: x["quality"]))
     except Exception as e:
         PICK_WHY[(sym, nth)] = f"data error ({type(e).__name__})"
         return None
@@ -1011,11 +1105,139 @@ def compute_learning(rows):
 
 # ----------------------------- SCAN -----------------------------
 
+TOP10_CONTRACTS = 3                              # contracts per expiry that are scored against each other
+TOP10_GRADES = (("A", 75), ("B", 60), ("C", 45))   # conviction points needed; anything lower = "D" (skip)
+GRADE_COL = {"A": "#2fbf71", "B": "#7bc96f", "C": "#f2a33a", "D": "#ef4f5f"}
+
+
+def conviction(a, opt, plan, side, earn):
+    """0-100 checklist built from the details shown on the pick box (score, market, price action, room to the next
+       level, RVOL, RSI, gap, reward:risk, delta, spread, liquidity, IV/HV, theta, earnings). Returns the points,
+       the grade (A >= 75, B >= 60, C >= 45, else D = skip) and every check with a tick / cross for the page.
+       It is a transparent rule-of-thumb filter - it removes weak setups, it does not predict the market."""
+    sg = 1 if side == "CALL" else -1
+    pts, checks = 0.0, []
+
+    def chk(v, ok, text):
+        nonlocal pts
+        pts += v
+        checks.append([ok, text])
+
+    # direction signal
+    sc = abs(a["score"])
+    if a["score"] * sg <= 0:
+        chk(-10, False, f"score {a['score']} does not back a {side}")
+    elif sc >= STRONG_SCORE:
+        chk(20, True, f"strong signal (score {a['score']})")
+    elif sc >= MIN_SCORE:
+        chk(12, True, f"signal ok (score {a['score']})")
+    else:
+        chk(0, False, f"weak signal (score {a['score']})")
+
+    # market (SPY) must not fight the trade
+    mk = [_tag_parts(t)[0] for t in a["tags"] if _tag_parts(t)[1] == "Mkt"]
+    if mk and mk[0] == sg:
+        chk(10, True, "market (SPY) agrees")
+    elif mk:
+        chk(-10, False, "market (SPY) fights the trade")
+    else:
+        chk(0, None, "market neutral")
+
+    # price action + room to the next support / resistance
+    pa = a["pa"]
+    if a["pa_s"] * sg > 0:
+        chk(12, True, f"price action agrees ({pa['struct']})")
+    elif a["pa_s"] * sg < 0:
+        chk(-12, False, "price action points against the trade")
+    else:
+        chk(0, None, f"price action neutral ({pa['struct']})")
+    room = pa["room_up"] if sg > 0 else pa["room_dn"]
+    if "PA:blocked" in a["tags"]:
+        chk(-10, False, "next support / resistance too close")
+    elif room is None:
+        chk(8, True, "open space ahead")
+    elif room >= a["move"]:
+        chk(10, True, f"{room:.2f} to the next level - room for the move")
+    elif room >= BLOCKED_FRAC * a["move"]:
+        chk(4, None, f"{room:.2f} to the next level - tight")
+    else:
+        chk(0, False, f"next level only {room:.2f} away")
+
+    # volume, RSI, gap
+    rv = a["rvol"]
+    if rv >= 1.2:
+        chk(8, True, f"volume {rv:.1f}x normal")
+    elif rv >= MIN_RVOL:
+        chk(4, None, f"volume {rv:.1f}x normal (average)")
+    else:
+        chk(0, False, f"thin volume {rv:.1f}x")
+    r = a["rsi"]
+    if (sg > 0 and r > 72) or (sg < 0 and r < 28):
+        chk(-5, False, f"RSI {r:.0f} stretched")
+    elif (sg > 0 and 50 <= r <= 70) or (sg < 0 and 30 <= r <= 50):
+        chk(5, True, f"RSI {r:.0f} supports the trade")
+    else:
+        chk(0, None, f"RSI {r:.0f} neutral")
+    g = a["gap"]
+    if g * sg >= 0.5:
+        chk(3, True, f"gap {g:+.1f}% with the trade")
+    elif g * sg <= -0.5:
+        chk(-3, False, f"gap {g:+.1f}% against the trade")
+
+    # the contract itself
+    if plan["rr"] >= 1.5:
+        chk(10, True, f"reward:risk {plan['rr']}")
+    elif plan["rr"] >= MIN_RR:
+        chk(6, None, f"reward:risk {plan['rr']} (acceptable)")
+    else:
+        chk(0, False, f"reward:risk {plan['rr']} too low")
+    d = abs(opt["delta"])
+    if abs(d - TARGET_DELTA) <= 0.08:
+        chk(5, True, f"delta {d:.2f} near the sweet spot")
+    else:
+        chk(2, None, f"delta {d:.2f}")
+    if not opt["market_open"]:
+        chk(2, None, "no live bid / ask - last price used")
+    elif opt["spread"] <= 5:
+        chk(5, True, f"tight spread {opt['spread']:.1f}%")
+    elif opt["spread"] <= MAX_SPREAD_PCT:
+        chk(3, None, f"spread {opt['spread']:.1f}%")
+    else:
+        chk(0, False, f"wide spread {opt['spread']:.1f}%")
+    if opt["oi"] >= 1000 or opt["vol"] >= opt["oi"]:
+        chk(3, True, f"liquid (vol {opt['vol']} / OI {opt['oi']})")
+    else:
+        chk(1, None, f"vol {opt['vol']} / OI {opt['oi']}")
+    if opt["iv_ratio"] <= 1.1:
+        chk(5, True, f"IV / HV {opt['iv_ratio']:.2f} - fairly priced")
+    elif opt["iv_ratio"] <= 1.3:
+        chk(3, None, f"IV / HV {opt['iv_ratio']:.2f}")
+    else:
+        chk(0, False, f"IV / HV {opt['iv_ratio']:.2f} - expensive")
+    theta_pct = abs(opt["theta"]) / max(plan["entry"], 0.01) * 100
+    if theta_pct <= 5:
+        chk(5, True, f"time decay {theta_pct:.1f}% of premium per day")
+    elif theta_pct <= 8:
+        chk(3, None, f"time decay {theta_pct:.1f}% of premium per day")
+    else:
+        chk(0, False, f"heavy time decay {theta_pct:.1f}% per day")
+    if earn:
+        chk(-30, False, "earnings before expiry")
+
+    total = int(round(min(max(pts, 0.0), 100.0)))
+    grade = "D"
+    for gname, need in TOP10_GRADES:
+        if total >= need:
+            grade = gname
+            break
+    return dict(pts=total, grade=grade, checks=checks)
+
+
 def build_top10(analysed):
-    """Top 10 US shares: for each one the predicted direction (CALL if the day estimate is above the price, else PUT),
-       the best next-expiry contract (same Greeks ranking as the main scan) and its trade plan (entry, stop loss, take
-       profit). Every share gets a lean; weak signals, low reward:risk and earnings before expiry are flagged
-       instead of hidden."""
+    """Top 10 US shares, next two expiries. For each share: the predicted direction (CALL if the day estimate is above
+       the price, else PUT). For each expiry the best TOP10_CONTRACTS contracts (Greeks / spread / liquidity ranking)
+       are turned into trade plans and graded with conviction(); the highest-conviction contract is shown. Then the
+       better expiry of each share is marked (best_exp) and the three best setups of grade C or better are ranked."""
     by = {a["sym"]: a for a in analysed}
 
     def one(item):
@@ -1025,20 +1247,43 @@ def build_top10(analysed):
             return dict(name=name, sym=sym, exp_n=nth + 1, error="no price data")
         side = "CALL" if a["pred_close"] > a["spot"] else "PUT"
         base = dict(name=name, sym=sym, side=side, score=a["score"], exp_n=nth + 1)
-        opt = pick_option(sym, a["spot"], side, a["hv"], nth)
-        if not opt:
+        opts = pick_option(sym, a["spot"], side, a["hv"], nth, top_k=TOP10_CONTRACTS)
+        if not opts:
             why = PICK_WHY.get((sym, nth))
-            return dict(base, error=f"no contract passed the filters" + (f": {why}" if why else ""))
-        plan = trade_plan(opt, a)
-        if not plan:
-            return dict(base, error="no positive reward on this contract")
+            return dict(base, error="no contract passed the filters" + (f": {why}" if why else ""))
+        earn = earnings_before(sym, opts[0]["expiry"])
+        best = None
+        for opt in opts:
+            plan = trade_plan(opt, a)
+            if not plan:
+                continue
+            cv = conviction(a, opt, plan, side, earn)
+            if best is None or cv["pts"] > best[2]["pts"]:
+                best = (opt, plan, cv)
+        if best is None:
+            return dict(base, error="no positive reward on these contracts")
+        opt, plan, cv = best
+        pa = a["pa"]
         return dict(base, strong=abs(a["score"]) >= STRONG_SCORE, weak=abs(a["score"]) < MIN_SCORE,
-                    low_rr=plan["rr"] < MIN_RR, earnings=earnings_before(sym, opt["expiry"]), opt=opt, plan=plan,
+                    low_rr=plan["rr"] < MIN_RR, earnings=earn, opt=opt, plan=plan, cv=cv,
                     a=dict(spot=a["spot"], pred_close=a["pred_close"], pred_high=a["pred_high"],
-                           pred_low=a["pred_low"], rsi=a["rsi"], rvol=a["rvol"], gap=a["gap"], tags=list(a["tags"])))
+                           pred_low=a["pred_low"], rsi=a["rsi"], rvol=a["rvol"], gap=a["gap"], tags=list(a["tags"]),
+                           struct=pa["struct"], candle=pa["candle"], pdh=pa["pdh"], pdl=pa["pdl"],
+                           room=(pa["room_up"] if side == "CALL" else pa["room_dn"]), day_atr=a["day_atr"],
+                           pa_s=a["pa_s"]))
 
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        return list(ex.map(one, [(n, s, k) for n, s in TOP10 for k in (0, 1)]))   # next expiry and the one after
+        rows = list(ex.map(one, [(n, s, k) for n, s in TOP10 for k in (0, 1)]))   # next expiry and the one after
+
+    ok = [r for r in rows if not r.get("error")]
+    for sym in {r["sym"] for r in ok}:
+        mine = [r for r in ok if r["sym"] == sym]
+        max(mine, key=lambda r: (r["cv"]["pts"], -r["exp_n"]))["best_exp"] = True     # better expiry of this share
+    ranked = sorted([r for r in ok if r.get("best_exp") and r["cv"]["grade"] != "D"],
+                    key=lambda r: -r["cv"]["pts"])
+    for i, r in enumerate(ranked[:3], 1):
+        r["rank"] = i
+    return rows
 
 
 def scan_once(mode, pre_prev=None, label=None):
@@ -1493,6 +1738,14 @@ def telegram_text(res):
             lines.append(f"Price action: {a['pa']['struct']} | {pa_txt}")
     if not shown:
         lines.append("No qualifying setup this scan.")
+    best = sorted([r for r in (res.get("top10") or []) if r.get("rank")], key=lambda r: r["rank"])
+    if best:
+        lines.append("")
+        lines.append("🏆 TOP-10 BEST SETUPS (conviction grade)")
+        for r in best:
+            o, p, cv = r["opt"], r["plan"], r["cv"]
+            lines.append(f"#{r['rank']} {r['sym']} {r['side']} {_moomoo_code(o)} ({_exp_label(r)}) grade {cv['grade']} "
+                         f"{cv['pts']} | buy {p['entry']:.2f} SL {p['sl']:.2f} TP {p['tp']:.2f}")
     return "\n".join(lines)
 
 # ----------------------------- DISPLAY -----------------------------
@@ -2251,9 +2504,15 @@ def _exp_label(r):
     return "next expiry" if r.get("exp_n", 1) == 1 else "2nd expiry"
 
 
+def _grade_badge(cv):
+    return (f'<span style="background:{GRADE_COL[cv["grade"]]};color:#fff;border-radius:4px;padding:1px 6px;'
+            f'font-size:11px;font-weight:700">{cv["grade"]} {cv["pts"]}</span>')
+
+
 def _top10_html(rows):
-    """One row per share: the pick (CALL / PUT) | next expiry | 2nd expiry side by side. Each expiry cell has the Moomoo
-       contract, buy limit, stop loss and take profit (with dollars per lot)."""
+    """One row per share: the pick (CALL / PUT) with its read of the chart | next expiry | 2nd expiry side by side.
+       Each expiry cell: conviction grade (star = better expiry of the two, #1-#3 = best setups of the 10), the Moomoo
+       contract, buy limit, stop loss and take profit (dollars per lot) and the key Greeks / spread / liquidity."""
     td = "padding:7px 6px;border-bottom:1px solid rgba(128,128,128,0.25);vertical-align:top"
     by = {}
     for r in rows:
@@ -2264,14 +2523,21 @@ def _top10_html(rows):
             return f'<td style="{td}"></td>'
         if r.get("error"):
             return f'<td style="{td};opacity:0.6;font-size:11px">{r["error"]}</td>'
-        o, p = r["opt"], r["plan"]
+        o, p, cv = r["opt"], r["plan"], r["cv"]
         flags = [f for f, on in (("weak", r["weak"]), ("low R:R", r["low_rr"]), ("earnings", r["earnings"])) if on]
         flag_txt = f'<div style="font-size:11px;color:#f2a33a">{", ".join(flags)}</div>' if flags else ""
+        star = ' <span style="color:#f2c94c" title="better expiry of the two">&#9733;</span>' if r.get("best_exp") else ""
+        rk = f' <b style="color:#f2c94c">#{r["rank"]}</b>' if r.get("rank") else ""
+        theta_pct = abs(o["theta"]) / max(p["entry"], 0.01) * 100
+        stats = (f'&Delta;{abs(o["delta"]):.2f} &Theta;{theta_pct:.0f}%/d IV/HV {o["iv_ratio"]:.2f} '
+                 f'spr {o["spread"]:.1f}% vol/OI {o["vol"]}/{o["oi"]}')
         return (f'<td style="{td};font-size:12px">'
-                f'<div style="opacity:0.7">{_moomoo_code(o)}</div>'
+                f'<div>{_grade_badge(cv)}{star}{rk}</div>'
+                f'<div style="opacity:0.7">{_moomoo_code(o)} &middot; R:R {p["rr"]}</div>'
                 f'<div>Buy <b>{p["entry"]:.2f}</b> <span style="opacity:0.6">(${p["cost_1lot"]:,.0f})</span></div>'
                 f'<div style="color:#ef4f5f">SL <b>{p["sl"]:.2f}</b> -${p["loss_1lot"]:,.0f}</div>'
-                f'<div style="color:#2fbf71">TP <b>{p["tp"]:.2f}</b> +${p["profit_1lot"]:,.0f}</div>{flag_txt}</td>')
+                f'<div style="color:#2fbf71">TP <b>{p["tp"]:.2f}</b> +${p["profit_1lot"]:,.0f}</div>'
+                f'<div style="font-size:11px;opacity:0.65">{stats}</div>{flag_txt}</td>')
 
     out = []
     for sym, d in by.items():
@@ -2281,10 +2547,18 @@ def _top10_html(rows):
             bg = "#2fbf71" if sides[0] == "CALL" else "#ef4f5f"
             badge = (f'<div style="margin-top:3px"><span style="background:{bg};color:#fff;border-radius:4px;'
                      f'padding:1px 6px;font-size:11px;font-weight:700">{sides[0]}</span></div>')
-        out.append(f'<tr><td style="{td}"><b>{sym}</b>{badge}</td>{cell(d.get(1))}{cell(d.get(2))}</tr>')
+        info = next((x["a"] for x in d.values() if x.get("a")), None)
+        read = ""
+        if info:
+            read = (f'<div style="font-size:11px;opacity:0.65;margin-top:3px">RSI {info["rsi"]:.0f} &middot; '
+                    f'RVOL {info["rvol"]:.1f}x<br>{info["struct"]}</div>')
+        out.append(f'<tr><td style="{td}"><b>{sym}</b>{badge}{read}</td>{cell(d.get(1))}{cell(d.get(2))}</tr>')
     head = ('<tr style="opacity:0.6;font-size:12px"><td style="padding:2px 6px">Share</td>'
             '<td style="padding:2px 6px">Next expiry</td><td style="padding:2px 6px">2nd expiry</td></tr>')
-    return f'<table style="width:100%;border-collapse:collapse;font-size:14px">{head}{"".join(out)}</table>'
+    legend = ('<div style="font-size:11px;opacity:0.65;margin-top:6px">Grade = conviction points out of 100 '
+              '(A 75+, B 60+, C 45+, D = skip). &#9733; = better expiry of the two. #1-#3 = best setups of the 10. '
+              'Of 3 candidate contracts per expiry the highest-grade one is shown.</div>')
+    return f'<table style="width:100%;border-collapse:collapse;font-size:14px">{head}{"".join(out)}</table>{legend}'
 
 
 def render_top10_box(box, res):
@@ -2309,11 +2583,14 @@ def render_top10_box(box, res):
 
 
 def render_top10_options(res):
-    """Top 10 US shares: predicted CALL / PUT on the next expiry, the values to enter in Moomoo, stop and profit."""
-    st.caption("For each of the top 10 US shares: the predicted direction for the day (CALL = up, PUT = down), the "
-               "best next-expiry contract by Greeks / spread / liquidity, and the numbers to type into the Moomoo "
-               "ticket. Every share gets a pick, so check the flags: 'weak' = score below the main scan's minimum, "
-               "'low R:R' = reward:risk below the minimum, 'earnings' = results due before expiry. Estimates, not advice.")
+    """Top 10 US shares: predicted CALL / PUT on the next two expiries, graded A-D from the pick-box details, with the
+       values to enter in Moomoo, stop and profit."""
+    st.caption("For each of the top 10 US shares: the predicted direction for the day (CALL = up, PUT = down). For each "
+               "of the next two expiries the 3 best contracts (Greeks / spread / liquidity) are compared and the one with "
+               "the highest conviction is shown. Conviction = a 0-100 checklist of the same details as the CALL / PUT pick "
+               "box: signal score, market (SPY), price action, room to the next level, volume, RSI, gap, reward:risk, "
+               "delta, spread, open interest, IV vs historical vol, time decay, earnings. A = 75+, B = 60+, C = 45+, "
+               "D = skip. It filters out weak setups; it cannot promise a win. Estimates, not advice.")
     if not res or res.get("running") or res.get("error"):
         st.info("No scan yet - press the Scan button above (or wait for the 09:45 ET scan).")
         return
@@ -2323,41 +2600,72 @@ def render_top10_options(res):
         return
     when = dt.datetime.fromisoformat(res["time"])
     st.write(f"From the scan at **{when.strftime('%a %d %b %H:%M')} ET** ({fmt_local(when)} your time)")
+
+    best = sorted([r for r in rows if r.get("rank")], key=lambda r: r["rank"])
+    if best:
+        st.markdown("**Best setups right now** (best expiry of each share, grade C or better)")
+        for r in best:
+            o, p, cv = r["opt"], r["plan"], r["cv"]
+            icon = "🟢" if r["side"] == "CALL" else "🔴"
+            st.write(f"#{r['rank']} {icon} **{r['sym']} {r['side']}** `{_moomoo_code(o)}` ({_exp_label(r)}) - grade "
+                     f"**{cv['grade']}** ({cv['pts']}/100) | buy {p['entry']:.2f} | SL {p['sl']:.2f} | TP {p['tp']:.2f} "
+                     f"| +${p['profit_1lot']:,.0f} / -${p['loss_1lot']:,.0f} per lot")
+    else:
+        st.warning("No share reaches grade C on its better expiry in this scan. Waiting for the next scan is a valid choice.")
+
+    hide_d = st.checkbox("Hide grade D (skip) rows", value=False, key="t10_hide_d")
     table = []
     for r in rows:
         if r.get("error"):
-            table.append({"Share": f"{r['name']} ({r['sym']})", "Pick": r.get("side", "-"), "Moomoo contract": r["error"]})
+            if not hide_d:
+                table.append({"Share": f"{r['name']} ({r['sym']})", "Pick": r.get("side", "-"), "Moomoo contract": r["error"]})
             continue
-        o, p = r["opt"], r["plan"]
+        cv = r["cv"]
+        if hide_d and cv["grade"] == "D":
+            continue
+        o, p, a = r["opt"], r["plan"], r["a"]
         flags = [f for f, on in (("weak", r["weak"]), ("low R:R", r["low_rr"]), ("earnings", r["earnings"])) if on]
-        table.append({"Share": f"{r['name']} ({r['sym']})", "Pick": r["side"], "Expiry": _exp_label(r) + " " + o["expiry"],
-                      "Moomoo contract": _moomoo_code(o),
-                      "Buy limit": p["entry"], "Stop loss": p["sl"], "Take profit": p["tp"],
-                      "Profit/lot $": p["profit_1lot"], "Loss/lot $": p["loss_1lot"], "R:R": p["rr"],
+        table.append({"Share": f"{r['name']} ({r['sym']})", "Pick": r["side"],
+                      "Expiry": _exp_label(r) + " " + o["expiry"], "Grade": cv["grade"], "Conviction": cv["pts"],
+                      "Best expiry": "★" if r.get("best_exp") else "", "Rank": r.get("rank", ""),
+                      "Moomoo contract": _moomoo_code(o), "Buy limit": p["entry"], "Stop loss": p["sl"],
+                      "Take profit": p["tp"], "Profit/lot $": p["profit_1lot"], "Loss/lot $": p["loss_1lot"],
+                      "R:R": p["rr"], "Delta": round(abs(o["delta"]), 2),
+                      "Theta %/day": round(abs(o["theta"]) / max(p["entry"], 0.01) * 100, 1),
+                      "IV/HV": round(o["iv_ratio"], 2), "Spread %": round(o["spread"], 1),
+                      "Vol/OI": f"{o['vol']}/{o['oi']}", "RVOL": round(a["rvol"], 1), "RSI": round(a["rsi"]),
+                      "Room": None if a.get("room") is None else round(a["room"], 2),
                       "Score": r["score"], "Flags": ", ".join(flags)})
-    st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
-    for r in rows:
-        if r.get("error"):
-            st.warning(f"{r['name']} ({r['sym']}): {r['error']}")
+    if table:
+        st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
+
+    for r in sorted([x for x in rows if not x.get("error")], key=lambda x: -x["cv"]["pts"]):
+        cv = r["cv"]
+        if hide_d and cv["grade"] == "D":
             continue
         o, p, a = r["opt"], r["plan"], r["a"]
         icon = "🟢" if r["side"] == "CALL" else "🔴"
-        flags = [f for f, on in (("weak signal", r["weak"]), ("low R:R", r["low_rr"]),
-                                 ("earnings before expiry", r["earnings"])) if on]
-        title = f"{icon} {r['sym']} - {r['side']} {_moomoo_code(o)} ({_exp_label(r)}) | buy {p['entry']:.2f} | SL {p['sl']:.2f} | TP {p['tp']:.2f}"
+        star = " ★" if r.get("best_exp") else ""
+        title = (f"{icon} {r['sym']} - {r['side']} {_moomoo_code(o)} ({_exp_label(r)}){star} | grade {cv['grade']} "
+                 f"{cv['pts']} | buy {p['entry']:.2f} | SL {p['sl']:.2f} | TP {p['tp']:.2f}")
         with st.expander(title):
-            if flags:
-                st.warning("Flags: " + ", ".join(flags))
+            st.markdown("**Why this grade**")
+            for ok_, text in cv["checks"]:
+                st.write(("✅ " if ok_ else ("❌ " if ok_ is False else "➖ ")) + text)
             st.markdown(f"**Enter in Moomoo:** `{_moomoo_code(o)}` · Buy · Limit **{p['entry']:.2f}** · 1 contract · Day · "
                         f"TP **{p['tp']:.2f}** · SL **{p['sl']:.2f}** (GTC)")
             st.write(f"**Take profit ${p['tp']:.2f} -> +${p['profit_1lot']:,.0f} per lot** | "
                      f"**stop loss ${p['sl']:.2f} -> -${p['loss_1lot']:,.0f} per lot** | cost ${p['cost_1lot']:,.0f} | "
                      f"reward:risk {p['rr']}")
-            st.write(f"Expiry **{o['expiry']}** ({o['dte']}d) | delta {o['delta']:.2f} | IV {o['iv'] * 100:.0f}% | "
-                     f"bid / ask {o['bid']:.2f} / {o['ask']:.2f} | vol / OI {o['vol']} / {o['oi']}")
+            st.write(f"Expiry **{o['expiry']}** ({o['dte']}d) | delta {o['delta']:.3f} | gamma {o['gamma']:.4f} | "
+                     f"theta {o['theta']:.3f}/day | vega {o['vega']:.3f} | rho {o['rho']:.3f} | IV {o['iv'] * 100:.1f}% "
+                     f"(IV/HV {o['iv_ratio']:.2f}) | bid / ask {o['bid']:.2f} / {o['ask']:.2f} | vol / OI {o['vol']} / {o['oi']}")
+            room_txt = "open space" if a.get("room") is None else f"{a['room']:.2f} to the next level"
             st.write(f"Stock {a['spot']:.2f} -> day estimate {a['pred_close']:.2f} (H {a['pred_high']:.2f} / "
-                     f"L {a['pred_low']:.2f}) | stock stop {p['stock_sl']} / target {p['stock_tp']} | "
-                     f"score {r['score']} | {' '.join(a['tags'])}")
+                     f"L {a['pred_low']:.2f}) | stock stop {p['stock_sl']} / target {p['stock_tp']} | gap {a['gap']:+.2f}% | "
+                     f"RSI {a['rsi']:.0f} | RVOL {a['rvol']:.1f}x | daily ATR {a['day_atr']:.2f}")
+            st.write(f"**Price action:** {a['struct']} | candle: {a['candle']} | PDH {a['pdh']:.2f} / PDL {a['pdl']:.2f} | "
+                     f"{room_txt} | score {r['score']} | {' '.join(a['tags'])}")
             if not o["market_open"]:
                 st.caption("Option quotes not live (market closed) - last price used. Confirm bid/ask before entry.")
             try:
@@ -2600,6 +2908,8 @@ def main():
     global LEARN_ON
     st.set_page_config(page_title="US Call/Put Scanner", layout="wide")
     cfg = load_config()
+    if not password_gate(cfg):                 # nothing below (scans, prices, picks) runs before the password is entered
+        return
 
     st.title("📈 US Top-100 Call / Put Scanner")
     st.caption("Scans: 09:45 ET, then every hour 10:45-14:45 ET - each one is sent to Telegram. Next expiry (not same "
@@ -2607,6 +2917,9 @@ def main():
                "them - educational only, not advice.")
 
     with st.sidebar:
+        if st.button("🔒 Log out"):
+            st.session_state["authed"] = False
+            st.rerun()
         auto = st.toggle("Auto scans (see schedule)", value=True)
         LEARN_ON = st.toggle("Self-learning (use learned signal weights)", value=True)
         with st.expander("Telegram"):
